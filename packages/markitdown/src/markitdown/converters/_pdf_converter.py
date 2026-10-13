@@ -1,11 +1,16 @@
 import sys
 import io
 import re
+import logging
+from collections import Counter, defaultdict
 from typing import BinaryIO, Any
 
 from .._base_converter import DocumentConverter, DocumentConverterResult
 from .._stream_info import StreamInfo
 from .._exceptions import MissingDependencyException, MISSING_DEPENDENCY_MESSAGE
+
+PDF_STRUCTURE_ALGORITHM = "huiwen-font-structure-v1-diagnostics"
+_logger = logging.getLogger(__name__)
 
 # Pattern for MasterFormat-style partial numbering (e.g., ".1", ".2", ".10")
 PARTIAL_NUMBERING_PATTERN = re.compile(r"^\.\d+$")
@@ -492,6 +497,190 @@ def _extract_tables_from_words(page: Any) -> list[list[list[str]]]:
     return [table_rows]
 
 
+def _font_size(char: dict) -> float:
+    """Group near-identical sizes into half-point bins."""
+    return round(float(char.get("size", 0)) * 2) / 2
+
+
+def _bold_text(text: str, chars: list[dict]) -> str:
+    """Preserve line spacing while marking runs of explicitly bold fonts."""
+    spans: list[tuple[int, int]] = []
+    cursor = 0
+    for char in chars:
+        value = char.get("text", "")
+        if not value:
+            continue
+        start = text.find(value, cursor)
+        if start < 0:
+            continue
+        end = start + len(value)
+        cursor = end
+        if value.strip() and re.search(
+            r"bold|black|heavy|demi|semibold", char.get("fontname", ""), re.I
+        ):
+            if spans and not text[spans[-1][1] : start].strip():
+                spans[-1] = (spans[-1][0], end)
+            else:
+                spans.append((start, end))
+    for start, end in reversed(spans):
+        text = text[:start] + "**" + text[start:end] + "**" + text[end:]
+    return text
+
+
+def _collect_text_features(page: Any, page_idx: int) -> tuple[Counter, list[dict]]:
+    """Keep compact line features; do not retain every page's character cache."""
+    sizes = Counter(
+        _font_size(char)
+        for char in page.chars
+        if char.get("text", "").strip() and _font_size(char) > 0
+    )
+    lines = page.extract_text_lines(return_chars=True)
+    features = []
+    for index, line in enumerate(lines):
+        chars = [char for char in line["chars"] if char.get("text", "").strip()]
+        if not chars or not line["text"].strip():
+            continue
+        line_sizes = Counter(_font_size(char) for char in chars)
+        size = line_sizes.most_common(1)[0][0]
+        previous_bottom = lines[index - 1]["bottom"] if index else 0
+        next_top = lines[index + 1]["top"] if index + 1 < len(lines) else page.height
+        features.append(
+            {
+                "text": " ".join(line["text"].split()),
+                "bold_text": _bold_text(line["text"], line["chars"]),
+                "size": size,
+                "uniform": line_sizes[size] / len(chars) >= 0.8,
+                "page": page_idx,
+                "margin": line["top"] < page.height * 0.08
+                or line["bottom"] > page.height * 0.92,
+                "gap": min(line["top"] - previous_bottom, next_top - line["bottom"]),
+                "short": line["x1"] - line["x0"] < page.width * 0.85,
+                "page_lines": len(lines),
+            }
+        )
+    return sizes, features
+
+
+def _restore_text_structure(
+    markdown: str, sizes: Counter, features: list[dict], page_count: int
+) -> str:
+    """Infer headings from relative font sizes, leaving table rows untouched."""
+    if not sizes:
+        _logger.warning(
+            "STRUCTURE_SKIP reason=no_font_sizes features=%d", len(features)
+        )
+        return markdown
+    body_size, count = sizes.most_common(1)[0]
+    dominant_body = count / sizes.total() >= 0.6
+    _logger.info(
+        "BODY size=%.2f share=%.3f dominant=%s chars=%d sizes=%s",
+        body_size,
+        count / sizes.total(),
+        dominant_body,
+        sizes.total(),
+        sizes.most_common(12),
+    )
+    margin_pages: dict[str, set[int]] = defaultdict(set)
+    for line in features:
+        if line["margin"]:
+            margin_pages[line["text"]].add(line["page"])
+    repeated = {
+        text
+        for text, pages in margin_pages.items()
+        if len(pages) >= max(2, (page_count + 1) // 2)
+    }
+
+    plain_lines = {
+        " ".join(text.split())
+        for text in markdown.splitlines()
+        if text.strip() and not text.lstrip().startswith("|")
+    }
+    candidates = []
+    rejected: Counter = Counter()
+    for line in features:
+        numbered = re.match(
+            r"^(\d+(?:\.\d+)*(?:[.、]\s*|\s+)|[一二三四五六七八九十]+、|[（(][一二三四五六七八九十]+[）)])",
+            line["text"],
+        )
+        cover = line["page"] == 0 and (
+            line["size"] >= body_size * 1.8
+            or (page_count > 1 and line["page_lines"] <= 5)
+        )
+        # ponytail: visual heuristics cannot recover all semantics; tune against real PDFs.
+        checks = {
+            "body_size": line["size"] >= body_size + max(1, body_size * 0.08),
+            "mixed_sizes": line["uniform"],
+            "wide_line": line["short"],
+            "long_line": len(line["text"]) <= 100,
+            "sentence_end": not re.search(r"[。！？；.!?;]$", line["text"]),
+            "repeated_margin": line["text"] not in repeated,
+            "text_unmatched_or_table": line["text"] in plain_lines,
+            "cover": not cover,
+            "tight_spacing": line["gap"] >= body_size * 0.3 or numbered,
+            "uncertain_body": dominant_body
+            or numbered
+            or line["size"] >= body_size * 1.2,
+        }
+        heading = all(checks.values())
+        rejected.update(reason for reason, passed in checks.items() if not passed)
+        line["heading"] = bool(heading)
+        if heading:
+            candidates.append(line["size"])
+    levels = {
+        size: min(index + 1, 6)
+        for index, size in enumerate(sorted(set(candidates), reverse=True))
+    }
+    _logger.info(
+        "HEADINGS candidates=%d levels=%s rejected=%s",
+        len(candidates),
+        levels,
+        dict(rejected),
+    )
+    replacements: dict[str, set[str]] = defaultdict(set)
+    for line in features:
+        if line["heading"]:
+            level = levels[line["size"]]
+            numbering = re.match(r"^(\d+(?:\.\d+)*)(?:[.、]\s*|\s+)", line["text"])
+            if numbering:
+                level = min(numbering[1].count(".") + 1, 6)
+            elif re.match(r"^[一二三四五六七八九十]+、", line["text"]):
+                level = 1
+            elif re.match(r"^[（(][一二三四五六七八九十]+[）)]", line["text"]):
+                level = 2
+            rendered = "#" * level + " " + line["text"]
+        else:
+            rendered = line["bold_text"]
+        replacements[line["text"]].add(rendered)
+
+    output = []
+    applied: Counter = Counter()
+    for text in markdown.splitlines():
+        key = " ".join(text.split())
+        options = replacements.get(key, set())
+        if key:
+            applied[
+                "table"
+                if text.lstrip().startswith("|")
+                else "matched"
+                if len(options) == 1
+                else "ambiguous"
+                if options
+                else "unmatched"
+            ] += 1
+        # Ambiguous repeated text and existing table markup retain original extraction.
+        if len(options) == 1 and not text.lstrip().startswith("|"):
+            rendered = next(iter(options))
+            if rendered.startswith("#"):
+                applied["headings"] += 1
+                text = "\n" + rendered + "\n"
+            elif rendered != key and "**" in rendered:
+                applied["bold"] += 1
+                text = rendered
+        output.append(text)
+    _logger.info("STRUCTURE_DONE counts=%s", dict(applied))
+    return "\n".join(output).strip()
+
+
 class PdfConverter(DocumentConverter):
     """
     Converts PDFs to Markdown.
@@ -523,7 +712,9 @@ class PdfConverter(DocumentConverter):
         stream_info: StreamInfo,
         **kwargs: Any,
     ) -> DocumentConverterResult:
+        _logger.info("PDF_START algorithm=%s", PDF_STRUCTURE_ALGORITHM)
         if _dependency_exc_info is not None:
+            _logger.error("PDF_DEPENDENCY_MISSING", exc_info=_dependency_exc_info)
             raise MissingDependencyException(
                 MISSING_DEPENDENCY_MESSAGE.format(
                     converter=type(self).__name__,
@@ -543,47 +734,74 @@ class PdfConverter(DocumentConverter):
             # Single pass: check every page for form-style content.
             # Pages with tables/forms get rich extraction; plain-text
             # pages are collected separately. page.close() is called
-            # after each page to free pdfplumber's cached objects and
-            # keep memory usage constant regardless of page count.
+            # after each page to free pdfplumber's cached objects;
+            # only compact line features are retained for document-wide analysis.
             markdown_chunks: list[str] = []
             form_page_count = 0
-            plain_page_indices: list[int] = []
+            sizes: Counter = Counter()
+            text_features: list[dict] = []
 
             with pdfplumber.open(pdf_bytes) as pdf:
                 for page_idx, page in enumerate(pdf.pages):
+                    page_sizes, page_features = _collect_text_features(page, page_idx)
+                    sizes.update(page_sizes)
+                    text_features.extend(page_features)
                     page_content = _extract_form_content_from_words(page)
+                    _logger.info(
+                        "PAGE page=%d lines=%d chars=%d branch=%s",
+                        page_idx + 1,
+                        len(page_features),
+                        page_sizes.total(),
+                        "form" if page_content is not None else "plain",
+                    )
 
                     if page_content is not None:
                         form_page_count += 1
                         if page_content.strip():
                             markdown_chunks.append(page_content)
                     else:
-                        plain_page_indices.append(page_idx)
                         text = page.extract_text()
                         if text and text.strip():
                             markdown_chunks.append(text.strip())
 
                     page.close()  # Free cached page data immediately
 
+                page_count = len(pdf.pages)
+
             # If no pages had form-style content, use pdfminer for
             # the whole document (better text spacing for prose).
             if form_page_count == 0:
+                _logger.info("TEXT_SOURCE mode=pdfminer pages=%d", page_count)
                 pdf_bytes.seek(0)
                 markdown = pdfminer.high_level.extract_text(pdf_bytes)
             else:
+                _logger.info(
+                    "TEXT_SOURCE mode=mixed pages=%d form_pages=%d",
+                    page_count,
+                    form_page_count,
+                )
                 markdown = "\n\n".join(markdown_chunks).strip()
 
+            markdown = _restore_text_structure(
+                markdown, sizes, text_features, page_count
+            )
+
         except Exception:
+            _logger.exception(
+                "PDF_FALLBACK reason=extraction_or_structure_error target=pdfminer"
+            )
             # Fallback if pdfplumber fails
             pdf_bytes.seek(0)
             markdown = pdfminer.high_level.extract_text(pdf_bytes)
 
         # Fallback if still empty
         if not markdown:
+            _logger.warning("PDF_FALLBACK reason=empty_output target=pdfminer")
             pdf_bytes.seek(0)
             markdown = pdfminer.high_level.extract_text(pdf_bytes)
 
         # Post-process to merge MasterFormat-style partial numbering with following text
         markdown = _merge_partial_numbering_lines(markdown)
+        _logger.info("PDF_DONE output_chars=%d", len(markdown))
 
         return DocumentConverterResult(markdown=markdown)
