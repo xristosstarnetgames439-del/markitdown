@@ -1,807 +1,464 @@
-import sys
-import io
-import re
+"""Text-layer PDFs: baseline reading order and explicitly ruled tables only."""
+
+import json
 import logging
-from collections import Counter, defaultdict
-from typing import BinaryIO, Any
+import re
+import statistics
+import sys
+from collections import Counter
+from typing import Any, BinaryIO
 
 from .._base_converter import DocumentConverter, DocumentConverterResult
-from .._stream_info import StreamInfo
 from .._exceptions import MissingDependencyException, MISSING_DEPENDENCY_MESSAGE
+from .._stream_info import StreamInfo
 
-PDF_STRUCTURE_ALGORITHM = "huiwen-font-structure-v1-diagnostics"
+PDF_STRUCTURE_ALGORITHM = "huiwen-baseline-ruled-tables-v2"
 _logger = logging.getLogger(__name__)
-
-# Pattern for MasterFormat-style partial numbering (e.g., ".1", ".2", ".10")
-PARTIAL_NUMBERING_PATTERN = re.compile(r"^\.\d+$")
-
-
-def _merge_partial_numbering_lines(text: str) -> str:
-    """
-    Post-process extracted text to merge MasterFormat-style partial numbering
-    with the following text line.
-
-    MasterFormat documents use partial numbering like:
-        .1  The intent of this Request for Proposal...
-        .2  Available information relative to...
-
-    Some PDF extractors split these into separate lines:
-        .1
-        The intent of this Request for Proposal...
-
-    This function merges them back together.
-    """
-    lines = text.split("\n")
-    result_lines: list[str] = []
-    i = 0
-
-    while i < len(lines):
-        line = lines[i]
-        stripped = line.strip()
-
-        # Check if this line is ONLY a partial numbering
-        if PARTIAL_NUMBERING_PATTERN.match(stripped):
-            # Look for the next non-empty line to merge with
-            j = i + 1
-            while j < len(lines) and not lines[j].strip():
-                j += 1
-
-            if j < len(lines):
-                # Merge the partial numbering with the next line
-                next_line = lines[j].strip()
-                result_lines.append(f"{stripped} {next_line}")
-                i = j + 1  # Skip past the merged line
-            else:
-                # No next line to merge with, keep as is
-                result_lines.append(line)
-                i += 1
-        else:
-            result_lines.append(line)
-            i += 1
-
-    return "\n".join(result_lines)
-
-
-# Load dependencies
 _dependency_exc_info = None
 try:
-    import pdfminer
-    import pdfminer.high_level
     import pdfplumber
 except ImportError:
     _dependency_exc_info = sys.exc_info()
 
-
-ACCEPTED_MIME_TYPE_PREFIXES = [
-    "application/pdf",
-    "application/x-pdf",
-]
-
-ACCEPTED_FILE_EXTENSIONS = [".pdf"]
-
-
-def _to_markdown_table(table: list[list[str]], include_separator: bool = True) -> str:
-    """Convert a 2D list (rows/columns) into a nicely aligned Markdown table.
-
-    Args:
-        table: 2D list of cell values
-        include_separator: If True, include header separator row (standard markdown).
-                          If False, output simple pipe-separated rows.
-    """
-    if not table:
-        return ""
-
-    # Normalize None → ""
-    table = [[cell if cell is not None else "" for cell in row] for row in table]
-
-    # Filter out empty rows
-    table = [row for row in table if any(cell.strip() for cell in row)]
-
-    if not table:
-        return ""
-
-    # Column widths
-    col_widths = [max(len(str(cell)) for cell in col) for col in zip(*table)]
-
-    def fmt_row(row: list[str]) -> str:
-        return (
-            "|"
-            + "|".join(str(cell).ljust(width) for cell, width in zip(row, col_widths))
-            + "|"
-        )
-
-    if include_separator:
-        header, *rows = table
-        md = [fmt_row(header)]
-        md.append("|" + "|".join("-" * w for w in col_widths) + "|")
-        for row in rows:
-            md.append(fmt_row(row))
-    else:
-        md = [fmt_row(row) for row in table]
-
-    return "\n".join(md)
-
-
-def _extract_form_content_from_words(page: Any) -> str | None:
-    """
-    Extract form-style content from a PDF page by analyzing word positions.
-    This handles borderless forms/tables where words are aligned in columns.
-
-    Returns markdown with proper table formatting:
-    - Tables have pipe-separated columns with header separator rows
-    - Non-table content is rendered as plain text
-
-    Returns None if the page doesn't appear to be a form-style document,
-    indicating that pdfminer should be used instead for better text spacing.
-    """
-    words = page.extract_words(keep_blank_chars=True, x_tolerance=3, y_tolerance=3)
-    if not words:
-        return None
-
-    # Group words by their Y position (rows)
-    y_tolerance = 5
-    rows_by_y: dict[float, list[dict]] = {}
-    for word in words:
-        y_key = round(word["top"] / y_tolerance) * y_tolerance
-        if y_key not in rows_by_y:
-            rows_by_y[y_key] = []
-        rows_by_y[y_key].append(word)
-
-    # Sort rows by Y position
-    sorted_y_keys = sorted(rows_by_y.keys())
-    page_width = page.width if hasattr(page, "width") else 612
-
-    # First pass: analyze each row
-    row_info: list[dict] = []
-    for y_key in sorted_y_keys:
-        row_words = sorted(rows_by_y[y_key], key=lambda w: w["x0"])
-        if not row_words:
-            continue
-
-        first_x0 = row_words[0]["x0"]
-        last_x1 = row_words[-1]["x1"]
-        line_width = last_x1 - first_x0
-        combined_text = " ".join(w["text"] for w in row_words)
-
-        # Count distinct x-position groups (columns)
-        x_positions = [w["x0"] for w in row_words]
-        x_groups: list[float] = []
-        for x in sorted(x_positions):
-            if not x_groups or x - x_groups[-1] > 50:
-                x_groups.append(x)
-
-        # Determine row type
-        is_paragraph = line_width > page_width * 0.55 and len(combined_text) > 60
-
-        # Check for MasterFormat-style partial numbering (e.g., ".1", ".2")
-        # These should be treated as list items, not table rows
-        has_partial_numbering = False
-        if row_words:
-            first_word = row_words[0]["text"].strip()
-            if PARTIAL_NUMBERING_PATTERN.match(first_word):
-                has_partial_numbering = True
-
-        row_info.append(
-            {
-                "y_key": y_key,
-                "words": row_words,
-                "text": combined_text,
-                "x_groups": x_groups,
-                "is_paragraph": is_paragraph,
-                "num_columns": len(x_groups),
-                "has_partial_numbering": has_partial_numbering,
-            }
-        )
-
-    # Collect ALL x-positions from rows with 3+ columns (table-like rows)
-    # This gives us the global column structure
-    all_table_x_positions: list[float] = []
-    for info in row_info:
-        if info["num_columns"] >= 3 and not info["is_paragraph"]:
-            all_table_x_positions.extend(info["x_groups"])
-
-    if not all_table_x_positions:
-        return None
-
-    # Compute adaptive column clustering tolerance based on gap analysis
-    all_table_x_positions.sort()
-
-    # Calculate gaps between consecutive x-positions
-    gaps = []
-    for i in range(len(all_table_x_positions) - 1):
-        gap = all_table_x_positions[i + 1] - all_table_x_positions[i]
-        if gap > 5:  # Only significant gaps
-            gaps.append(gap)
-
-    # Determine optimal tolerance using statistical analysis
-    if gaps and len(gaps) >= 3:
-        # Use 70th percentile of gaps as threshold (balances precision/recall)
-        sorted_gaps = sorted(gaps)
-        percentile_70_idx = int(len(sorted_gaps) * 0.70)
-        adaptive_tolerance = sorted_gaps[percentile_70_idx]
-
-        # Clamp tolerance to reasonable range [25, 50]
-        adaptive_tolerance = max(25, min(50, adaptive_tolerance))
-    else:
-        # Fallback to conservative value
-        adaptive_tolerance = 35
-
-    # Compute global column boundaries using adaptive tolerance
-    global_columns: list[float] = []
-    for x in all_table_x_positions:
-        if not global_columns or x - global_columns[-1] > adaptive_tolerance:
-            global_columns.append(x)
-
-    # Adaptive max column check based on page characteristics
-    # Calculate average column width
-    if len(global_columns) > 1:
-        content_width = global_columns[-1] - global_columns[0]
-        avg_col_width = content_width / len(global_columns)
-
-        # Forms with very narrow columns (< 30px) are likely dense text
-        if avg_col_width < 30:
-            return None
-
-        # Compute adaptive max based on columns per inch
-        # Typical forms have 3-8 columns per inch
-        columns_per_inch = len(global_columns) / (content_width / 72)
-
-        # If density is too high (> 10 cols/inch), likely not a form
-        if columns_per_inch > 10:
-            return None
-
-        # Adaptive max: allow more columns for wider pages
-        # Standard letter is 612pt wide, so scale accordingly
-        adaptive_max_columns = int(20 * (page_width / 612))
-        adaptive_max_columns = max(15, adaptive_max_columns)  # At least 15
-
-        if len(global_columns) > adaptive_max_columns:
-            return None
-    else:
-        # Single column, not a form
-        return None
-
-    # Now classify each row as table row or not
-    # A row is a table row if it has words that align with 2+ of the global columns
-    for info in row_info:
-        if info["is_paragraph"]:
-            info["is_table_row"] = False
-            continue
-
-        # Rows with partial numbering (e.g., ".1", ".2") are list items, not table rows
-        if info["has_partial_numbering"]:
-            info["is_table_row"] = False
-            continue
-
-        # Count how many global columns this row's words align with
-        aligned_columns: set[int] = set()
-        for word in info["words"]:
-            word_x = word["x0"]
-            for col_idx, col_x in enumerate(global_columns):
-                if abs(word_x - col_x) < 40:
-                    aligned_columns.add(col_idx)
-                    break
-
-        # If row uses 2+ of the established columns, it's a table row
-        info["is_table_row"] = len(aligned_columns) >= 2
-
-    # Find table regions (consecutive table rows)
-    table_regions: list[tuple[int, int]] = []  # (start_idx, end_idx)
-    i = 0
-    while i < len(row_info):
-        if row_info[i]["is_table_row"]:
-            start_idx = i
-            while i < len(row_info) and row_info[i]["is_table_row"]:
-                i += 1
-            end_idx = i
-            table_regions.append((start_idx, end_idx))
-        else:
-            i += 1
-
-    # Check if enough rows are table rows (at least 20%)
-    total_table_rows = sum(end - start for start, end in table_regions)
-    if len(row_info) > 0 and total_table_rows / len(row_info) < 0.2:
-        return None
-
-    # Build output - collect table data first, then format with proper column widths
-    result_lines: list[str] = []
-    num_cols = len(global_columns)
-
-    # Helper function to extract cells from a row
-    def extract_cells(info: dict) -> list[str]:
-        cells: list[str] = ["" for _ in range(num_cols)]
-        for word in info["words"]:
-            word_x = word["x0"]
-            # Find the correct column using boundary ranges
-            assigned_col = num_cols - 1  # Default to last column
-            for col_idx in range(num_cols - 1):
-                col_end = global_columns[col_idx + 1]
-                if word_x < col_end - 20:
-                    assigned_col = col_idx
-                    break
-            if cells[assigned_col]:
-                cells[assigned_col] += " " + word["text"]
-            else:
-                cells[assigned_col] = word["text"]
-        return cells
-
-    # Process rows, collecting table data for proper formatting
-    idx = 0
-    while idx < len(row_info):
-        info = row_info[idx]
-
-        # Check if this row starts a table region
-        table_region = None
-        for start, end in table_regions:
-            if idx == start:
-                table_region = (start, end)
-                break
-
-        if table_region:
-            start, end = table_region
-            # Collect all rows in this table
-            table_data: list[list[str]] = []
-            for table_idx in range(start, end):
-                cells = extract_cells(row_info[table_idx])
-                table_data.append(cells)
-
-            # Calculate column widths for this table
-            if table_data:
-                col_widths = [
-                    max(len(row[col]) for row in table_data) for col in range(num_cols)
-                ]
-                # Ensure minimum width of 3 for separator dashes
-                col_widths = [max(w, 3) for w in col_widths]
-
-                # Format header row
-                header = table_data[0]
-                header_str = (
-                    "| "
-                    + " | ".join(
-                        cell.ljust(col_widths[i]) for i, cell in enumerate(header)
-                    )
-                    + " |"
-                )
-                result_lines.append(header_str)
-
-                # Format separator row
-                separator = (
-                    "| "
-                    + " | ".join("-" * col_widths[i] for i in range(num_cols))
-                    + " |"
-                )
-                result_lines.append(separator)
-
-                # Format data rows
-                for row in table_data[1:]:
-                    row_str = (
-                        "| "
-                        + " | ".join(
-                            cell.ljust(col_widths[i]) for i, cell in enumerate(row)
-                        )
-                        + " |"
-                    )
-                    result_lines.append(row_str)
-
-            idx = end  # Skip to end of table region
-        else:
-            # Check if we're inside a table region (not at start)
-            in_table = False
-            for start, end in table_regions:
-                if start < idx < end:
-                    in_table = True
-                    break
-
-            if not in_table:
-                # Non-table content
-                result_lines.append(info["text"])
-            idx += 1
-
-    return "\n".join(result_lines)
-
-
-def _extract_tables_from_words(page: Any) -> list[list[list[str]]]:
-    """
-    Extract tables from a PDF page by analyzing word positions.
-    This handles borderless tables where words are aligned in columns.
-
-    This function is designed for structured tabular data (like invoices),
-    not for multi-column text layouts in scientific documents.
-    """
-    words = page.extract_words(keep_blank_chars=True, x_tolerance=3, y_tolerance=3)
-    if not words:
-        return []
-
-    # Group words by their Y position (rows)
-    y_tolerance = 5
-    rows_by_y: dict[float, list[dict]] = {}
-    for word in words:
-        y_key = round(word["top"] / y_tolerance) * y_tolerance
-        if y_key not in rows_by_y:
-            rows_by_y[y_key] = []
-        rows_by_y[y_key].append(word)
-
-    # Sort rows by Y position
-    sorted_y_keys = sorted(rows_by_y.keys())
-
-    # Find potential column boundaries by analyzing x positions across all rows
-    all_x_positions = []
-    for words_in_row in rows_by_y.values():
-        for word in words_in_row:
-            all_x_positions.append(word["x0"])
-
-    if not all_x_positions:
-        return []
-
-    # Cluster x positions to find column starts
-    all_x_positions.sort()
-    x_tolerance_col = 20
-    column_starts: list[float] = []
-    for x in all_x_positions:
-        if not column_starts or x - column_starts[-1] > x_tolerance_col:
-            column_starts.append(x)
-
-    # Need at least 3 columns but not too many (likely text layout, not table)
-    if len(column_starts) < 3 or len(column_starts) > 10:
-        return []
-
-    # Find rows that span multiple columns (potential table rows)
-    table_rows = []
-    for y_key in sorted_y_keys:
-        words_in_row = sorted(rows_by_y[y_key], key=lambda w: w["x0"])
-
-        # Assign words to columns
-        row_data = [""] * len(column_starts)
-        for word in words_in_row:
-            # Find the closest column
-            best_col = 0
-            min_dist = float("inf")
-            for i, col_x in enumerate(column_starts):
-                dist = abs(word["x0"] - col_x)
-                if dist < min_dist:
-                    min_dist = dist
-                    best_col = i
-
-            if row_data[best_col]:
-                row_data[best_col] += " " + word["text"]
-            else:
-                row_data[best_col] = word["text"]
-
-        # Only include rows that have content in multiple columns
-        non_empty = sum(1 for cell in row_data if cell.strip())
-        if non_empty >= 2:
-            table_rows.append(row_data)
-
-    # Validate table quality - tables should have:
-    # 1. Enough rows (at least 3 including header)
-    # 2. Short cell content (tables have concise data, not paragraphs)
-    # 3. Consistent structure across rows
-    if len(table_rows) < 3:
-        return []
-
-    # Check if cells contain short, structured data (not long text)
-    long_cell_count = 0
-    total_cell_count = 0
-    for row in table_rows:
-        for cell in row:
-            if cell.strip():
-                total_cell_count += 1
-                # If cell has more than 30 chars, it's likely prose text
-                if len(cell.strip()) > 30:
-                    long_cell_count += 1
-
-    # If more than 30% of cells are long, this is probably not a table
-    if total_cell_count > 0 and long_cell_count / total_cell_count > 0.3:
-        return []
-
-    return [table_rows]
-
-
-def _font_size(char: dict) -> float:
-    """Group near-identical sizes into half-point bins."""
-    return round(float(char.get("size", 0)) * 2) / 2
-
-
-def _bold_text(text: str, chars: list[dict]) -> str:
-    """Preserve line spacing while marking runs of explicitly bold fonts."""
-    spans: list[tuple[int, int]] = []
-    cursor = 0
+PARTIAL_NUMBERING_PATTERN = re.compile(r"^\.\d+$")
+_BOLD = re.compile(r"bold|black|heavy|demi", re.I)
+_MONO = re.compile(r"courier|consolas|monaco|mono", re.I)
+_LABELS = {"目的", "重要规则"}
+_BULLET = re.compile(r"^[•●▪◦]\s*")
+_LIST = re.compile(r"^(?:[-*+]\s+|\d+[.)、]\s+|\.\d+\s+)")
+
+
+def _merge_partial_numbering_lines(text: str) -> str:
+    return re.sub(r"(?m)^(\.\d+)\s*\n\s*(?=\S)", r"\1 ", text)
+
+
+def _baseline(char: dict, height: float) -> float:
+    matrix = char.get("matrix")
+    return (
+        height - matrix[5] if matrix and char.get("upright", True) else char["bottom"]
+    )
+
+
+def _contains(box: tuple, char: dict, height: float) -> bool:
+    x = (char["x0"] + char["x1"]) / 2
+    y = _baseline(char, height)
+    return box[0] <= x < box[2] and box[1] - 0.6 <= y < box[3]
+
+
+def _join_text(left: str, right: str) -> str:
+    if not left or not right:
+        return left + right
+    if left.endswith("**") and right.startswith("**"):
+        return _join_text(left[:-2], right[2:])
+    # Preserve word boundaries for English; Chinese layout wraps need no extra space.
+    space = bool(
+        re.search(r"[A-Za-z0-9]$", left.rstrip("*"))
+        and re.match(r"[A-Za-z0-9]", right.lstrip("*"))
+    )
+    return left.rstrip() + (" " if space else "") + right.lstrip()
+
+
+def _line(chars: list[dict], height: float) -> dict:
+    chars = sorted(chars, key=lambda char: char["x0"])
+    raw, styled, run = "", "", ""
+    bold = False
+    previous = None
     for char in chars:
-        value = char.get("text", "")
-        if not value:
+        value = char["text"]
+        is_bold = bool(_BOLD.search(char.get("fontname", "")))
+        gap = char["x0"] - previous["x1"] if previous else 0
+        space = (
+            " "
+            if previous
+            and gap > max(0.7, min(char["size"], previous["size"]) * 0.15)
+            and not raw.endswith(" ")
+            and not value.startswith(" ")
+            else ""
+        )
+        raw += space + value
+        if is_bold != bold:
+            styled += "**" + run.strip() + "**" if bold and run.strip() else run
+            run = ""
+            bold = is_bold
+        run += space + value
+        previous = char
+    styled += "**" + run.strip() + "**" if bold and run.strip() else run
+    nonblank = [char for char in chars if char["text"].strip()]
+    sizes = Counter(round(char["size"] * 2) / 2 for char in nonblank)
+    return dict(
+        kind="line",
+        text=raw.strip(),
+        markdown=styled.strip(),
+        x0=chars[0]["x0"],
+        x1=max(char["x1"] for char in chars),
+        y=statistics.median(_baseline(char, height) for char in chars),
+        size=sizes.most_common(1)[0][0] if sizes else 0,
+        chars=len(nonblank),
+    )
+
+
+def _lines(chars: list[dict], height: float) -> list[dict]:
+    """Group mixed CJK/Latin glyphs by baseline, never by glyph top."""
+    groups: list[list[dict]] = []
+    for char in sorted(chars, key=lambda char: (_baseline(char, height), char["x0"])):
+        if not char.get("text"):
             continue
-        start = text.find(value, cursor)
-        if start < 0:
-            continue
-        end = start + len(value)
-        cursor = end
-        if value.strip() and re.search(
-            r"bold|black|heavy|demi|semibold", char.get("fontname", ""), re.I
+        if (
+            not groups
+            or abs(_baseline(char, height) - _baseline(groups[-1][0], height)) > 0.6
         ):
-            if spans and not text[spans[-1][1] : start].strip():
-                spans[-1] = (spans[-1][0], end)
-            else:
-                spans.append((start, end))
-    for start, end in reversed(spans):
-        text = text[:start] + "**" + text[start:end] + "**" + text[end:]
-    return text
+            groups.append([])
+        groups[-1].append(char)
+    return [line for group in groups if (line := _line(group, height))["text"]]
 
 
-def _collect_text_features(page: Any, page_idx: int) -> tuple[Counter, list[dict]]:
-    """Keep compact line features; do not retain every page's character cache."""
-    sizes = Counter(
-        _font_size(char)
-        for char in page.chars
-        if char.get("text", "").strip() and _font_size(char) > 0
-    )
-    lines = page.extract_text_lines(return_chars=True)
-    features = []
-    for index, line in enumerate(lines):
-        chars = [char for char in line["chars"] if char.get("text", "").strip()]
-        if not chars or not line["text"].strip():
-            continue
-        line_sizes = Counter(_font_size(char) for char in chars)
-        size = line_sizes.most_common(1)[0][0]
-        previous_bottom = lines[index - 1]["bottom"] if index else 0
-        next_top = lines[index + 1]["top"] if index + 1 < len(lines) else page.height
-        features.append(
-            {
-                "text": " ".join(line["text"].split()),
-                "bold_text": _bold_text(line["text"], line["chars"]),
-                "size": size,
-                "uniform": line_sizes[size] / len(chars) >= 0.8,
-                "page": page_idx,
-                "margin": line["top"] < page.height * 0.08
-                or line["bottom"] > page.height * 0.92,
-                "gap": min(line["top"] - previous_bottom, next_top - line["bottom"]),
-                "short": line["x1"] - line["x0"] < page.width * 0.85,
-                "page_lines": len(lines),
-            }
-        )
-    return sizes, features
-
-
-def _restore_text_structure(
-    markdown: str, sizes: Counter, features: list[dict], page_count: int
-) -> str:
-    """Infer headings from relative font sizes, leaving table rows untouched."""
-    if not sizes:
-        _logger.warning(
-            "STRUCTURE_SKIP reason=no_font_sizes features=%d", len(features)
-        )
-        return markdown
-    body_size, count = sizes.most_common(1)[0]
-    dominant_body = count / sizes.total() >= 0.6
-    _logger.info(
-        "BODY size=%.2f share=%.3f dominant=%s chars=%d sizes=%s",
-        body_size,
-        count / sizes.total(),
-        dominant_body,
-        sizes.total(),
-        sizes.most_common(12),
-    )
-    margin_pages: dict[str, set[int]] = defaultdict(set)
-    for line in features:
-        if line["margin"]:
-            margin_pages[line["text"]].add(line["page"])
-    repeated = {
-        text
-        for text, pages in margin_pages.items()
-        if len(pages) >= max(2, (page_count + 1) // 2)
-    }
-
-    plain_lines = {
-        " ".join(text.split())
-        for text in markdown.splitlines()
-        if text.strip() and not text.lstrip().startswith("|")
-    }
-    candidates = []
-    rejected: Counter = Counter()
-    for line in features:
-        numbered = re.match(
-            r"^(\d+(?:\.\d+)*(?:[.、]\s*|\s+)|[一二三四五六七八九十]+、|[（(][一二三四五六七八九十]+[）)])",
-            line["text"],
-        )
-        cover = line["page"] == 0 and (
-            line["size"] >= body_size * 1.8
-            or (page_count > 1 and line["page_lines"] <= 5)
-        )
-        # ponytail: visual heuristics cannot recover all semantics; tune against real PDFs.
-        checks = {
-            "body_size": line["size"] >= body_size + max(1, body_size * 0.08),
-            "mixed_sizes": line["uniform"],
-            "wide_line": line["short"],
-            "long_line": len(line["text"]) <= 100,
-            "sentence_end": not re.search(r"[。！？；.!?;]$", line["text"]),
-            "repeated_margin": line["text"] not in repeated,
-            "text_unmatched_or_table": line["text"] in plain_lines,
-            "cover": not cover,
-            "tight_spacing": line["gap"] >= body_size * 0.3 or numbered,
-            "uncertain_body": dominant_body
-            or numbered
-            or line["size"] >= body_size * 1.2,
-        }
-        heading = all(checks.values())
-        rejected.update(reason for reason, passed in checks.items() if not passed)
-        line["heading"] = bool(heading)
-        if heading:
-            candidates.append(line["size"])
-    levels = {
-        size: min(index + 1, 6)
-        for index, size in enumerate(sorted(set(candidates), reverse=True))
-    }
-    _logger.info(
-        "HEADINGS candidates=%d levels=%s rejected=%s",
-        len(candidates),
-        levels,
-        dict(rejected),
-    )
-    replacements: dict[str, set[str]] = defaultdict(set)
-    for line in features:
-        if line["heading"]:
-            level = levels[line["size"]]
-            numbering = re.match(r"^(\d+(?:\.\d+)*)(?:[.、]\s*|\s+)", line["text"])
-            if numbering:
-                level = min(numbering[1].count(".") + 1, 6)
-            elif re.match(r"^[一二三四五六七八九十]+、", line["text"]):
-                level = 1
-            elif re.match(r"^[（(][一二三四五六七八九十]+[）)]", line["text"]):
-                level = 2
-            rendered = "#" * level + " " + line["text"]
+def _paragraphs(lines: list[dict], *, cell: bool = False) -> str:
+    output: list[str] = []
+    previous = None
+    for line in lines:
+        text = line["text"] if cell else line["markdown"]
+        bullet = _BULLET.match(line["text"])
+        if bullet:
+            # Remove the original marker before styling, without rewriting its content.
+            text = "- " + line["text"][bullet.end() :]
+        new = previous is None or bullet or _LIST.match(line["text"])
+        if previous:
+            new = (
+                new
+                or line["y"] - previous["y"]
+                > max(line["size"], previous["size"]) * 1.65
+            )
+            new = (
+                new
+                or abs(line["x0"] - previous["x0"])
+                > max(line["size"], previous["size"]) * 2
+            )
+        if new:
+            output.append(text)
         else:
-            rendered = line["bold_text"]
-        replacements[line["text"]].add(rendered)
+            output[-1] = _join_text(output[-1], text)
+        previous = line
+    return _merge_partial_numbering_lines(("<br>" if cell else "\n\n").join(output))
 
+
+def _table_text(table: Any, assigned: dict[tuple, list[dict]], height: float) -> str:
+    rows = []
+    for row in table.rows:
+        cells = []
+        for box in row.cells:
+            if box is None:
+                cells.append("")
+                continue
+            lines = _lines(assigned.get(tuple(box), []), height)
+            # Narrow identifier columns are stacked labels; prose cells unwrap layout lines.
+            stacked = (
+                lines
+                and all(len(line["text"]) <= 20 for line in lines)
+                and (box[2] - box[0] < 160 or re.fullmatch(r"R\d+", lines[0]["text"]))
+            )
+            value = (
+                "<br>".join(line["text"] for line in lines)
+                if stacked
+                else _paragraphs(lines, cell=True)
+            )
+            if stacked:
+                metadata = re.fullmatch(
+                    r"(R\d+)\s*(.*?)\s*(\d{4}-\s*\d{2}-\s*\d{2})",
+                    "".join(line["text"] for line in lines),
+                )
+                if metadata:
+                    value = "<br>".join(
+                        part
+                        for part in (
+                            metadata[1],
+                            metadata[2].strip(),
+                            re.sub(r"\s", "", metadata[3]),
+                        )
+                        if part
+                    )
+            cells.append(value.replace("\\", "\\\\").replace("|", r"\|"))
+        rows.append(cells)
+    width = max(map(len, rows))
+    rows = [row + [""] * (width - len(row)) for row in rows]
+    rendered = ["| " + " | ".join(row) + " |" for row in rows]
+    rendered.insert(1, "| " + " | ".join(["---"] * width) + " |")
+    return "\n".join(rendered)
+
+
+def _code_boxes(page: Any, explicit: list[dict]) -> list[dict]:
+    """Only neutral filled rectangles with monospace text are code candidates."""
+    if explicit:
+        return explicit
+    boxes = []
+    for rect in sorted(
+        page.rects,
+        key=lambda r: (r["x1"] - r["x0"]) * (r["bottom"] - r["top"]),
+        reverse=True,
+    ):
+        color = rect.get("non_stroking_color")
+        color = (color,) if isinstance(color, (int, float)) else color
+        if not rect.get("fill") or not color or len(color) not in (1, 3):
+            continue
+        if min(color) < 0.85 or max(color) >= 0.995 or max(color) - min(color) > 0.08:
+            continue
+        box = (rect["x0"], rect["top"], rect["x1"], rect["bottom"])
+        if any(
+            other["bbox"][0] <= box[0]
+            and other["bbox"][1] <= box[1]
+            and other["bbox"][2] >= box[2]
+            and other["bbox"][3] >= box[3]
+            for other in boxes
+        ):
+            continue
+        inside = [char for char in page.chars if _contains(box, char, page.height)]
+        if (
+            sum(bool(_MONO.search(char.get("fontname", ""))) for char in inside) >= 8
+            and len(_lines(inside, page.height)) >= 2
+        ):
+            boxes.append({"bbox": box})
+    return boxes
+
+
+def _code_text(chars: list[dict], height: float, language: str = "") -> str:
+    lines = _lines(chars, height)
+    if not lines:
+        return ""
+    origin = min(line["x0"] for line in lines)
+    widths = [
+        char["x1"] - char["x0"]
+        for char in chars
+        if _MONO.search(char.get("fontname", "")) and char["x1"] > char["x0"]
+    ]
+    unit = statistics.median(widths) if widths else lines[0]["size"] * 0.6
+    text_lines = []
+    spacings = [b["y"] - a["y"] for a, b in zip(lines, lines[1:])]
+    spacing = statistics.median(spacings) if spacings else 0
+    previous = None
+    for line in lines:
+        if previous and spacing and line["y"] - previous["y"] > spacing * 1.6:
+            text_lines.append("")
+        text_lines.append(
+            " " * max(0, round((line["x0"] - origin) / unit)) + line["text"]
+        )
+        previous = line
+    text = "\n".join(text_lines)
+    if not language:
+        language = (
+            "json"
+            if text.lstrip().startswith(("{", "["))
+            else "markdown"
+            if re.search(r"(?m)^#{1,6}\s", text)
+            else "text"
+        )
+    if language == "json":
+        # Unwrap only newlines inside JSON strings, leaving all content characters intact.
+        repaired, quoted, escaped = "", False, False
+        for part in text.splitlines():
+            if repaired:
+                repaired += "" if quoted else "\n"
+            part = part.lstrip() if quoted else part
+            repaired += part
+            for char in part:
+                if escaped:
+                    escaped = False
+                elif char == "\\" and quoted:
+                    escaped = True
+                elif char == '"':
+                    quoted = not quoted
+        try:
+            json.loads(repaired)
+            text = repaired
+        except ValueError:
+            _logger.warning("CODE_JSON_INVALID preserving_extracted_text=True")
+    fence = "`" * max(
+        3, max((len(match[0]) + 1 for match in re.finditer(r"`+", text)), default=3)
+    )
+    return f"{fence}{language}\n{text}\n{fence}"
+
+
+def _page_blocks(page: Any, code_regions: list[dict]) -> list[dict]:
+    # Explicit line strategies never infer a table from aligned words or paragraph spacing.
+    tables = [
+        table
+        for table in page.find_tables(
+            {"vertical_strategy": "lines", "horizontal_strategy": "lines"}
+        )
+        if len(table.rows) >= 2 and max(len(row.cells) for row in table.rows) >= 2
+    ]
+    code_boxes = _code_boxes(page, code_regions)
+    table_chars: list[dict[tuple, list[dict]]] = [{} for table in tables]
+    code_chars: list[list[dict]] = [[] for box in code_boxes]
+    plain = []
+    for char in page.chars:
+        found = False
+        for index, table in enumerate(tables):
+            # Each glyph is owned once, including glyphs touching a cell's lower border.
+            cell = next(
+                (
+                    tuple(box)
+                    for row in table.rows
+                    for box in row.cells
+                    if box and _contains(box, char, page.height)
+                ),
+                None,
+            )
+            if cell is not None:
+                table_chars[index].setdefault(cell, []).append(char)
+                found = True
+                break
+        if found:
+            continue
+        for index, box in enumerate(code_boxes):
+            if _contains(box["bbox"], char, page.height):
+                code_chars[index].append(char)
+                found = True
+                break
+        if not found:
+            plain.append(char)
+    blocks = _lines(plain, page.height)
+    blocks += [
+        dict(
+            kind="table",
+            y=table.bbox[1],
+            x0=table.bbox[0],
+            markdown=_table_text(table, owned, page.height),
+        )
+        for table, owned in zip(tables, table_chars)
+    ]
+    blocks += [
+        dict(
+            kind="code",
+            y=box["bbox"][1],
+            x0=box["bbox"][0],
+            markdown=_code_text(chars, page.height, box.get("language", "")),
+        )
+        for box, chars in zip(code_boxes, code_chars)
+    ]
+    _logger.info(
+        "PAGE page=%d chars=%d lines=%d ruled_tables=%d code_blocks=%d",
+        page.page_number,
+        len(page.chars),
+        len(blocks) - len(tables) - len(code_boxes),
+        len(tables),
+        len(code_boxes),
+    )
+    return sorted(blocks, key=lambda block: (block["y"], block["x0"]))
+
+
+def _render_pages(pages: list[tuple[float, list[dict]]]) -> str:
+    sizes: Counter = Counter()
+    for height, blocks in pages:
+        for line in blocks:
+            if line["kind"] == "line" and line["y"] < height * 0.94:
+                sizes[line["size"]] += line["chars"]
+    body = sizes.most_common(1)[0][0] if sizes else 10
+    heading_sizes = sorted(
+        {size for size in sizes if size >= body + max(1, body * 0.1)}, reverse=True
+    )
+    levels = {size: min(index + 1, 6) for index, size in enumerate(heading_sizes)}
+    _logger.info(
+        "BODY size=%.2f sizes=%s heading_levels=%s", body, sizes.most_common(12), levels
+    )
     output = []
-    applied: Counter = Counter()
-    for text in markdown.splitlines():
-        key = " ".join(text.split())
-        options = replacements.get(key, set())
-        if key:
-            applied[
-                "table"
-                if text.lstrip().startswith("|")
-                else "matched"
-                if len(options) == 1
-                else "ambiguous"
-                if options
-                else "unmatched"
-            ] += 1
-        # Ambiguous repeated text and existing table markup retain original extraction.
-        if len(options) == 1 and not text.lstrip().startswith("|"):
-            rendered = next(iter(options))
-            if rendered.startswith("#"):
-                applied["headings"] += 1
-                text = "\n" + rendered + "\n"
-            elif rendered != key and "**" in rendered:
-                applied["bold"] += 1
-                text = rendered
-        output.append(text)
-    _logger.info("STRUCTURE_DONE counts=%s", dict(applied))
-    return "\n".join(output).strip()
+    for page_number, (height, blocks) in enumerate(pages, 1):
+        paragraphs: list[dict] = []
+        rendered: list[str] = []
+
+        def flush():
+            if paragraphs:
+                rendered.append(_paragraphs(paragraphs))
+                paragraphs.clear()
+
+        for index, block in enumerate(blocks):
+            if block["kind"] != "line":
+                flush()
+                rendered.append(block["markdown"])
+                continue
+            level = levels.get(block["size"])
+            if block["text"] in _LABELS:
+                level = 3
+            footer = block["y"] > height * 0.94 and block["size"] < body * 0.9
+            if footer:
+                flush()
+                rendered.append("<small>" + block["text"] + "</small>")
+            elif (
+                level
+                and len(block["text"]) <= 120
+                and not re.search(r"[。！？；]$", block["text"])
+            ):
+                flush()
+                marker = "#" * level + " "
+                if (
+                    rendered
+                    and rendered[-1].startswith(marker)
+                    and block.get("previous_heading_size") == block["size"]
+                ):
+                    rendered[-1] = _join_text(rendered[-1], block["text"])
+                else:
+                    rendered.append(marker + block["text"])
+                # Only directly adjacent, same-size heading lines are merged below.
+            else:
+                paragraphs.append(block)
+            # Store adjacency on the next line, without relying on textual equality.
+            if level and not footer and index + 1 < len(blocks):
+                following = blocks[index + 1]
+                if (
+                    following["kind"] == "line"
+                    and following["y"] - block["y"] <= block["size"] * 1.5
+                ):
+                    following["previous_heading_size"] = block["size"]
+        flush()
+        _logger.info(
+            "RENDER page=%d headings=%d tables=%d code_blocks=%d",
+            page_number,
+            sum(bool(re.match(r"^#{1,6} ", block)) for block in rendered),
+            sum(block["kind"] == "table" for block in blocks),
+            sum(block["kind"] == "code" for block in blocks),
+        )
+        output.append(f"<!-- PDF page {page_number} -->\n\n" + "\n\n".join(rendered))
+    return "\n\n".join(output).strip()
 
 
 class PdfConverter(DocumentConverter):
-    """
-    Converts PDFs to Markdown.
-    Supports extracting tables into aligned Markdown format (via pdfplumber).
-    Falls back to pdfminer if pdfplumber is missing or fails.
-    """
+    """Convert a text layer using baseline order and drawn cell boundaries."""
 
     def accepts(
-        self,
-        file_stream: BinaryIO,
-        stream_info: StreamInfo,
-        **kwargs: Any,
+        self, file_stream: BinaryIO, stream_info: StreamInfo, **kwargs: Any
     ) -> bool:
-        mimetype = (stream_info.mimetype or "").lower()
-        extension = (stream_info.extension or "").lower()
-
-        if extension in ACCEPTED_FILE_EXTENSIONS:
-            return True
-
-        for prefix in ACCEPTED_MIME_TYPE_PREFIXES:
-            if mimetype.startswith(prefix):
-                return True
-
-        return False
+        return (stream_info.extension or "").lower() == ".pdf" or (
+            stream_info.mimetype or ""
+        ).lower().startswith(("application/pdf", "application/x-pdf"))
 
     def convert(
-        self,
-        file_stream: BinaryIO,
-        stream_info: StreamInfo,
-        **kwargs: Any,
+        self, file_stream: BinaryIO, stream_info: StreamInfo, **kwargs: Any
     ) -> DocumentConverterResult:
         _logger.info("PDF_START algorithm=%s", PDF_STRUCTURE_ALGORITHM)
         if _dependency_exc_info is not None:
-            _logger.error("PDF_DEPENDENCY_MISSING", exc_info=_dependency_exc_info)
             raise MissingDependencyException(
                 MISSING_DEPENDENCY_MESSAGE.format(
-                    converter=type(self).__name__,
-                    extension=".pdf",
-                    feature="pdf",
+                    converter=type(self).__name__, extension=".pdf", feature="pdf"
                 )
-            ) from _dependency_exc_info[1].with_traceback(
-                _dependency_exc_info[2]
-            )  # type: ignore[union-attr]
-
-        assert isinstance(file_stream, io.IOBase)
-
-        # Read file stream into BytesIO for compatibility with pdfplumber
-        pdf_bytes = io.BytesIO(file_stream.read())
-
+            ) from _dependency_exc_info[1]
+        pages = []
+        # Callers may explicitly set code regions by 1-based page; no sample coordinates are hardcoded.
+        code_regions = kwargs.get("pdf_code_regions", {})
         try:
-            # Single pass: check every page for form-style content.
-            # Pages with tables/forms get rich extraction; plain-text
-            # pages are collected separately. page.close() is called
-            # after each page to free pdfplumber's cached objects;
-            # only compact line features are retained for document-wide analysis.
-            markdown_chunks: list[str] = []
-            form_page_count = 0
-            sizes: Counter = Counter()
-            text_features: list[dict] = []
-
-            with pdfplumber.open(pdf_bytes) as pdf:
-                for page_idx, page in enumerate(pdf.pages):
-                    page_sizes, page_features = _collect_text_features(page, page_idx)
-                    sizes.update(page_sizes)
-                    text_features.extend(page_features)
-                    page_content = _extract_form_content_from_words(page)
-                    _logger.info(
-                        "PAGE page=%d lines=%d chars=%d branch=%s",
-                        page_idx + 1,
-                        len(page_features),
-                        page_sizes.total(),
-                        "form" if page_content is not None else "plain",
-                    )
-
-                    if page_content is not None:
-                        form_page_count += 1
-                        if page_content.strip():
-                            markdown_chunks.append(page_content)
-                    else:
-                        text = page.extract_text()
-                        if text and text.strip():
-                            markdown_chunks.append(text.strip())
-
-                    page.close()  # Free cached page data immediately
-
-                page_count = len(pdf.pages)
-
-            # If no pages had form-style content, use pdfminer for
-            # the whole document (better text spacing for prose).
-            if form_page_count == 0:
-                _logger.info("TEXT_SOURCE mode=pdfminer pages=%d", page_count)
-                pdf_bytes.seek(0)
-                markdown = pdfminer.high_level.extract_text(pdf_bytes)
-            else:
-                _logger.info(
-                    "TEXT_SOURCE mode=mixed pages=%d form_pages=%d",
-                    page_count,
-                    form_page_count,
-                )
-                markdown = "\n\n".join(markdown_chunks).strip()
-
-            markdown = _restore_text_structure(
-                markdown, sizes, text_features, page_count
-            )
-
+            with pdfplumber.open(file_stream) as pdf:
+                for page in pdf.pages:
+                    try:
+                        pages.append(
+                            (
+                                page.height,
+                                _page_blocks(
+                                    page, code_regions.get(page.page_number, [])
+                                ),
+                            )
+                        )
+                    finally:
+                        page.close()
+            markdown = _render_pages(pages)
         except Exception:
-            _logger.exception(
-                "PDF_FALLBACK reason=extraction_or_structure_error target=pdfminer"
-            )
-            # Fallback if pdfplumber fails
-            pdf_bytes.seek(0)
-            markdown = pdfminer.high_level.extract_text(pdf_bytes)
-
-        # Fallback if still empty
-        if not markdown:
-            _logger.warning("PDF_FALLBACK reason=empty_output target=pdfminer")
-            pdf_bytes.seek(0)
-            markdown = pdfminer.high_level.extract_text(pdf_bytes)
-
-        # Post-process to merge MasterFormat-style partial numbering with following text
-        markdown = _merge_partial_numbering_lines(markdown)
-        _logger.info("PDF_DONE output_chars=%d", len(markdown))
-
+            _logger.exception("PDF_FAILED no_silent_plain_text_fallback=True")
+            raise
+        _logger.info("PDF_DONE output_chars=%d pages=%d", len(markdown), len(pages))
         return DocumentConverterResult(markdown=markdown)
