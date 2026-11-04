@@ -11,8 +11,14 @@ from typing import Any, BinaryIO
 from .._base_converter import DocumentConverter, DocumentConverterResult
 from .._exceptions import MissingDependencyException, MISSING_DEPENDENCY_MESSAGE
 from .._stream_info import StreamInfo
+from ._pdf_media import (
+    PdfMedia,
+    ocr_blocks,
+    rotated_text,
+    literal_text as _literal,
+)
 
-PDF_STRUCTURE_ALGORITHM = "huiwen-baseline-ruled-tables-v2"
+PDF_STRUCTURE_ALGORITHM = "huiwen-rich-pdf-v3"
 _logger = logging.getLogger(__name__)
 _dependency_exc_info = None
 try:
@@ -22,7 +28,7 @@ except ImportError:
 
 PARTIAL_NUMBERING_PATTERN = re.compile(r"^\.\d+$")
 _BOLD = re.compile(r"bold|black|heavy|demi", re.I)
-_MONO = re.compile(r"courier|consolas|monaco|mono", re.I)
+_MONO = re.compile(r"courier|consolas|monaco|mono|menlo|sourcecode", re.I)
 _LABELS = {"目的", "重要规则"}
 _BULLET = re.compile(r"^[•●▪◦]\s*")
 _LIST = re.compile(r"^(?:[-*+]\s+|\d+[.)、]\s+|\.\d+\s+)")
@@ -64,7 +70,7 @@ def _line(chars: list[dict], height: float) -> dict:
     bold = False
     previous = None
     for char in chars:
-        value = char["text"]
+        value = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", " ", char["text"])
         is_bold = bool(_BOLD.search(char.get("fontname", "")))
         gap = char["x0"] - previous["x1"] if previous else 0
         space = (
@@ -80,7 +86,7 @@ def _line(chars: list[dict], height: float) -> dict:
             styled += "**" + run.strip() + "**" if bold and run.strip() else run
             run = ""
             bold = is_bold
-        run += space + value
+        run += space + _literal(value)
         previous = char
     styled += "**" + run.strip() + "**" if bold and run.strip() else run
     nonblank = [char for char in chars if char["text"].strip()]
@@ -90,6 +96,7 @@ def _line(chars: list[dict], height: float) -> dict:
         text=raw.strip(),
         markdown=styled.strip(),
         x0=chars[0]["x0"],
+        text_x0=nonblank[0]["x0"] if nonblank else chars[0]["x0"],
         x1=max(char["x1"] for char in chars),
         y=statistics.median(_baseline(char, height) for char in chars),
         size=sizes.most_common(1)[0][0] if sizes else 0,
@@ -120,7 +127,8 @@ def _paragraphs(lines: list[dict], *, cell: bool = False) -> str:
         bullet = _BULLET.match(line["text"])
         if bullet:
             # Remove the original marker before styling, without rewriting its content.
-            text = "- " + line["text"][bullet.end() :]
+            content = line["text"][bullet.end() :]
+            text = "- " + (content if cell else _literal(content))
         new = previous is None or bullet or _LIST.match(line["text"])
         if previous:
             new = (
@@ -176,7 +184,7 @@ def _table_text(table: Any, assigned: dict[tuple, list[dict]], height: float) ->
                         )
                         if part
                     )
-            cells.append(value.replace("\\", "\\\\").replace("|", r"\|"))
+            cells.append("<br>".join(_literal(part) for part in value.split("<br>")))
         rows.append(cells)
     width = max(map(len, rows))
     rows = [row + [""] * (width - len(row)) for row in rows]
@@ -190,18 +198,37 @@ def _code_boxes(page: Any, explicit: list[dict]) -> list[dict]:
     if explicit:
         return explicit
     boxes = []
-    for rect in sorted(
-        page.rects,
-        key=lambda r: (r["x1"] - r["x0"]) * (r["bottom"] - r["top"]),
-        reverse=True,
-    ):
+    backgrounds = []
+    for rect in page.rects + page.curves:
         color = rect.get("non_stroking_color")
         color = (color,) if isinstance(color, (int, float)) else color
-        if not rect.get("fill") or not color or len(color) not in (1, 3):
+        if (
+            not rect.get("fill")
+            or not isinstance(color, (tuple, list))
+            or len(color) not in (1, 3)
+        ):
             continue
         if min(color) < 0.85 or max(color) >= 0.995 or max(color) - min(color) > 0.08:
             continue
         box = (rect["x0"], rect["top"], rect["x1"], rect["bottom"])
+        backgrounds.append(box)
+    # Word/PDF exporters often paint a code background one row at a time.
+    # Merge touching rows with the same horizontal extent before testing the font.
+    merged = []
+    for box in sorted(backgrounds, key=lambda b: (b[0], b[2], b[1])):
+        if (
+            merged
+            and abs(box[0] - merged[-1][0]) < 1
+            and abs(box[2] - merged[-1][2]) < 1
+            and abs(box[1] - merged[-1][3]) < 1
+        ):
+            previous = merged[-1]
+            merged[-1] = (previous[0], previous[1], previous[2], box[3])
+        else:
+            merged.append(box)
+    for box in sorted(
+        merged, key=lambda b: (b[2] - b[0]) * (b[3] - b[1]), reverse=True
+    ):
         if any(
             other["bbox"][0] <= box[0]
             and other["bbox"][1] <= box[1]
@@ -223,7 +250,7 @@ def _code_text(chars: list[dict], height: float, language: str = "") -> str:
     lines = _lines(chars, height)
     if not lines:
         return ""
-    origin = min(line["x0"] for line in lines)
+    origin = min(line["text_x0"] for line in lines)
     widths = [
         char["x1"] - char["x0"]
         for char in chars
@@ -238,17 +265,31 @@ def _code_text(chars: list[dict], height: float, language: str = "") -> str:
         if previous and spacing and line["y"] - previous["y"] > spacing * 1.6:
             text_lines.append("")
         text_lines.append(
-            " " * max(0, round((line["x0"] - origin) / unit)) + line["text"]
+            " " * max(0, round((line["text_x0"] - origin) / unit)) + line["text"]
         )
         previous = line
     text = "\n".join(text_lines)
     if not language:
+        # Printed line numbers remain in the output; ignore them only for language detection.
+        probe = re.sub(r"(?m)^\s*\d+\s+", "", text)
         language = (
-            "json"
-            if text.lstrip().startswith(("{", "["))
-            else "markdown"
-            if re.search(r"(?m)^#{1,6}\s", text)
-            else "text"
+            "python"
+            if re.search(
+                r"(?m)^\s*(?:def |class \w+.*:|from \w+ import |import \w|for .* in .*:|if .*:|print\()",
+                probe,
+            )
+            else (
+                "javascript"
+                if re.search(
+                    r"(?m)^\s*(?:function\b|(?:var|let|const)\s|console\.|for\s*\()",
+                    probe,
+                )
+                else (
+                    "json"
+                    if text.lstrip().startswith(("{", "["))
+                    else "markdown" if re.search(r"(?m)^#{1,6}\s", text) else "text"
+                )
+            )
         )
     if language == "json":
         # Unwrap only newlines inside JSON strings, leaving all content characters intact.
@@ -380,7 +421,9 @@ def _render_pages(pages: list[tuple[float, list[dict]]]) -> str:
             footer = block["y"] > height * 0.94 and block["size"] < body * 0.9
             if footer:
                 flush()
-                rendered.append("<small>" + block["text"] + "</small>")
+                import html
+
+                rendered.append("<small>" + html.escape(block["text"]) + "</small>")
             elif (
                 level
                 and len(block["text"]) <= 120
@@ -395,7 +438,7 @@ def _render_pages(pages: list[tuple[float, list[dict]]]) -> str:
                 ):
                     rendered[-1] = _join_text(rendered[-1], block["text"])
                 else:
-                    rendered.append(marker + block["text"])
+                    rendered.append(marker + _literal(block["text"]))
                 # Only directly adjacent, same-size heading lines are merged below.
             else:
                 paragraphs.append(block)
@@ -440,25 +483,108 @@ class PdfConverter(DocumentConverter):
                 )
             ) from _dependency_exc_info[1]
         pages = []
+        media = PdfMedia(file_stream, kwargs.get("pdf_image_writer"))
+        extracted = 0
         # Callers may explicitly set code regions by 1-based page; no sample coordinates are hardcoded.
         code_regions = kwargs.get("pdf_code_regions", {})
         try:
             with pdfplumber.open(file_stream) as pdf:
+                media.scan(pdf)
                 for page in pdf.pages:
                     try:
+                        chars, watermarks = rotated_text(page.chars)
+                        usable = [c for c in chars if c.get("text", "").strip()]
+                        vector_marks, logos, images = media.page(page, bool(usable))
+                        watermarks += vector_marks
+                        if not usable and (page.images or page.curves):
+                            bitmap = media.bitmap(page)
+                            histogram = bitmap.convert("L").histogram()
+                            if (
+                                sum(histogram[:220]) / (bitmap.width * bitmap.height)
+                                < 0.00005
+                            ):
+                                blocks = images
+                                _logger.info("BLANK_SCAN page=%d", page.page_number)
+                            else:
+                                blocks, confidence = ocr_blocks(
+                                    bitmap, page.width, page.height
+                                )
+                                message = (
+                                    "本页为 OCR 识别，复杂表格和公式请核对页尾原图。"
+                                    if blocks
+                                    else "本页未识别到可靠文字，已保留原图，请人工核对。"
+                                )
+                                blocks.insert(
+                                    0,
+                                    dict(
+                                        kind="notice",
+                                        y=-1,
+                                        x0=0,
+                                        markdown="> " + message,
+                                    ),
+                                )
+                                if len(images) == 1 and images[0].get("full_page"):
+                                    images[0]["markdown"] = images[0][
+                                        "markdown"
+                                    ].replace("原文插图", f"第{page.page_number}页原图（OCR核对）")
+                                    blocks.extend(images)
+                                else:
+                                    blocks.extend(images)
+                                    blocks.append(
+                                        dict(
+                                            kind="image",
+                                            y=page.height,
+                                            x0=0,
+                                            markdown=f"![第{page.page_number}页原图（OCR核对）]({media.save_image(bitmap, page, 'page')})",
+                                        )
+                                    )
+                        else:
+                            # Filtering only removes rotated glyphs; table lines and code backgrounds stay.
+                            removed = {id(c) for c in page.chars} - {
+                                id(c) for c in chars
+                            }
+                            body_page = (
+                                page.filter(lambda obj: id(obj) not in removed)
+                                if removed
+                                else page
+                            )
+                            blocks = _page_blocks(
+                                body_page, code_regions.get(page.page_number, [])
+                            )
+                            blocks += images
+                            blocks.sort(key=lambda block: (block["y"], block["x0"]))
+                        extracted += sum(
+                            len(b.get("text", b["markdown"]))
+                            for b in blocks
+                            if b["kind"] != "notice"
+                        )
+                        blocks = [
+                            dict(kind="watermark", y=-2, x0=0, markdown=m)
+                            for m in watermarks
+                        ] + blocks
+                        blocks += [
+                            dict(kind="logo", y=page.height + 1, x0=0, markdown=m)
+                            for m in logos
+                        ]
                         pages.append(
                             (
                                 page.height,
-                                _page_blocks(
-                                    page, code_regions.get(page.page_number, [])
-                                ),
+                                blocks,
                             )
                         )
                     finally:
                         page.close()
+            if not extracted:
+                raise ValueError("PDF 未提取到文字或图像；不能仅以页码标记判定转换成功")
             markdown = _render_pages(pages)
+            if len(markdown.encode("utf-8")) > 16 * 1024 * 1024:
+                raise RuntimeError(
+                    "转换结果超过当前预览的 16 MiB 上限，请拆分 PDF 后转换"
+                )
         except Exception:
             _logger.exception("PDF_FAILED no_silent_plain_text_fallback=True")
             raise
+        finally:
+            media.close()
         _logger.info("PDF_DONE output_chars=%d pages=%d", len(markdown), len(pages))
         return DocumentConverterResult(markdown=markdown)

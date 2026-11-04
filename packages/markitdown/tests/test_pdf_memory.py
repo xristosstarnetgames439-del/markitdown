@@ -13,6 +13,10 @@ def page(number):
     value = MagicMock()
     value.page_number = number
     value.height = 792
+    value.width = 612
+    value.chars = []
+    value.images = []
+    value.curves = []
     return value
 
 
@@ -23,8 +27,18 @@ def test_page_cache_closed_before_processing_next_page():
 
     def blocks(current, regions):
         if current.page_number > 1:
-            pages[current.page_number - 2].close.assert_called_once()
-        return []
+            assert pages[current.page_number - 2].close.call_count == 2
+        return [
+            dict(
+                kind="line",
+                y=100,
+                x0=20,
+                text="body",
+                markdown="body",
+                size=10,
+                chars=4,
+            )
+        ]
 
     with patch(
         "markitdown.converters._pdf_converter.pdfplumber.open", return_value=opened
@@ -34,7 +48,8 @@ def test_page_cache_closed_before_processing_next_page():
         PdfConverter().convert(io.BytesIO(b"pdf"), StreamInfo(extension=".pdf"))
     reader.assert_called_once()
     for current in pages:
-        current.close.assert_called_once()
+        # One lightweight media scan, then one extraction pass; neither keeps page caches.
+        assert current.close.call_count == 2
 
 
 def test_extraction_error_closes_page_and_is_not_silently_downgraded(caplog):
@@ -49,5 +64,5 @@ def test_extraction_error_closes_page_and_is_not_silently_downgraded(caplog):
     ):
         with pytest.raises(ValueError, match="broken geometry"):
             PdfConverter().convert(io.BytesIO(b"pdf"), StreamInfo(extension=".pdf"))
-    current.close.assert_called_once()
+    assert current.close.call_count == 2
     assert "no_silent_plain_text_fallback=True" in caplog.text
