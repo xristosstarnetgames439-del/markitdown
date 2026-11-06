@@ -94,15 +94,21 @@ def _line(chars: list[dict], height: float) -> dict:
     styled += "**" + run.strip() + "**" if bold and run.strip() else run
     nonblank = [char for char in chars if char["text"].strip()]
     sizes = Counter(round(char["size"] * 2) / 2 for char in nonblank)
+    widths = [
+        char["x1"] - char["x0"]
+        for char in nonblank
+        if re.fullmatch(r"[\u3400-\u9fff]", char["text"]) and char["x1"] > char["x0"]
+    ]
     return dict(
         kind="line",
         text=raw.strip(),
         markdown=styled.strip(),
         x0=chars[0]["x0"],
         text_x0=nonblank[0]["x0"] if nonblank else chars[0]["x0"],
-        x1=max(char["x1"] for char in chars),
+        x1=max(char["x1"] for char in nonblank or chars),
         y=statistics.median(_baseline(char, height) for char in chars),
         size=sizes.most_common(1)[0][0] if sizes else 0,
+        char_width=statistics.median(widths) if widths else 0,
         chars=len(nonblank),
     )
 
@@ -123,29 +129,82 @@ def _lines(chars: list[dict], height: float) -> list[dict]:
 
 
 def _paragraphs(lines: list[dict], *, cell: bool = False) -> str:
+    if not lines:
+        return ""
+    body_lines = [
+        line
+        for line in lines
+        if not (_BULLET.match(line["text"]) or _LIST.match(line["text"]))
+    ]
+    origin = min(line["x0"] for line in body_lines or lines)
+    right = max(line["x1"] for line in body_lines or lines)
+    # 按实际正文行距估计，不以字号限制大行距；取较小一半避免段间距拉高结果。
+    spacings = sorted(
+        (line["y"] - previous["y"]) / max(line["size"], previous["size"], 1)
+        for previous, line in zip(lines, lines[1:])
+        if line["y"] > previous["y"]
+        and abs(line["x0"] - previous["x0"])
+        <= max(line["size"], previous["size"]) * 2.5
+    )
+    spacing = (
+        statistics.median(spacings[: (len(spacings) + 1) // 2]) if spacings else 1.4
+    )
     output: list[str] = []
     previous = None
+    list_left = None
     for line in lines:
         text = line["text"] if cell else line["markdown"]
         bullet = _BULLET.match(line["text"])
+        marker = bool(bullet or _LIST.match(line["text"]))
+        unit = line.get("char_width") or line["size"] or 1
+        x = line.get("text_x0", line["x0"])
+        indented = not cell and not marker and 1.5 * unit <= x - origin <= 2.5 * unit
         if bullet:
             # Remove the original marker before styling, without rewriting its content.
             content = line["text"][bullet.end() :]
             text = "- " + (content if cell else _literal(content))
-        new = previous is None or bullet or _LIST.match(line["text"])
+        new = previous is None or marker
         if previous:
-            new = (
-                new
-                or line["y"] - previous["y"]
-                > max(line["size"], previous["size"]) * 1.65
-            )
-            new = (
-                new
-                or abs(line["x0"] - previous["x0"])
-                > max(line["size"], previous["size"]) * 2
-            )
+            size = max(line["size"], previous["size"], 1)
+            gap = line["y"] - previous["y"]
+            if cell:
+                # 表格仍使用原有单元格规则，不引入正文首行缩进。
+                new = (
+                    new
+                    or gap > size * 1.65
+                    or abs(line["x0"] - previous["x0"]) > size * 2
+                )
+            else:
+                previous_x = previous.get("text_x0", previous["x0"])
+                # 首行不足两字的缩进回退也属于续行，但不补成两字视觉缩进。
+                returned = (
+                    0 < previous_x - origin <= unit * 2.5
+                    and abs(x - origin) <= unit * 0.5
+                )
+                hanging = list_left is not None and 0 < x - list_left <= unit * 2.5
+                new = (
+                    new
+                    or gap <= 0
+                    or gap > size * spacing * 1.4
+                    or abs(line["size"] - previous["size"]) > size * 0.2
+                    or (indented and list_left is None)
+                    or (
+                        abs(x - previous_x) > unit * 0.75
+                        and not returned
+                        and not hanging
+                    )
+                    or (list_left is not None and x <= list_left + unit * 0.5)
+                    or (
+                        right - previous["x1"] > unit * 2
+                        and re.search(r"[。！？.!?][\"'”’」』]*$", previous["text"])
+                    )
+                )
         if new:
-            output.append(text)
+            list_left = x if marker else None
+            # 全角空格保留视觉缩进，避免四个普通空格被 Markdown 当作代码。
+            output.append(
+                ("\u3000\u3000" if indented and list_left is None else "") + text
+            )
         else:
             output[-1] = _join_text(output[-1], text)
         previous = line
