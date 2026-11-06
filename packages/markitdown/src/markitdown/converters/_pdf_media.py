@@ -137,10 +137,14 @@ def ocr_words(image, *, psm=3):
     return words
 
 
-def ocr_blocks(image, width, height):
+def ocr_blocks(image, width, height, excluded_boxes=()):
     words = ocr_words(image)
     lines = defaultdict(list)
     for word in words:
+        x = (word["left"] + word["width"] / 2) * width / image.width
+        y = (word["top"] + word["height"] / 2) * height / image.height
+        if any(box[0] <= x < box[2] and box[1] <= y < box[3] for box in excluded_boxes):
+            continue
         lines[(word["block_num"], word["par_num"], word["line_num"])].append(word)
     blocks = []
     for line in lines.values():
@@ -224,6 +228,51 @@ def _box(obj):
     return obj["x0"], obj["top"], obj["x1"], obj["bottom"]
 
 
+def _box_inside(inner, outer, tolerance=0):
+    return (
+        outer[0] - tolerance <= inner[0]
+        and outer[1] - tolerance <= inner[1]
+        and outer[2] + tolerance >= inner[2]
+        and outer[3] + tolerance >= inner[3]
+    )
+
+
+def _boxes_overlap(first, second):
+    return max(first[0], second[0]) < min(first[2], second[2]) and max(
+        first[1], second[1]
+    ) < min(first[3], second[3])
+
+
+def _outside_regions(box, excluded):
+    """保留图像落在表格之外的部分，避免整张丢弃或把表格重复输出。"""
+    regions = [box]
+    for other in excluded:
+        remaining = []
+        for part in regions:
+            if not _boxes_overlap(part, other):
+                remaining.append(part)
+                continue
+            x0, y0, x1, y1 = part
+            left, top, right, bottom = (
+                max(x0, other[0]),
+                max(y0, other[1]),
+                min(x1, other[2]),
+                min(y1, other[3]),
+            )
+            remaining.extend(
+                region
+                for region in (
+                    (x0, y0, x1, top),
+                    (x0, bottom, x1, y1),
+                    (x0, top, left, bottom),
+                    (right, top, x1, bottom),
+                )
+                if region[2] > region[0] and region[3] > region[1]
+            )
+        regions = remaining
+    return regions
+
+
 def _union(boxes):
     return (
         min(b[0] for b in boxes),
@@ -287,13 +336,7 @@ def _figure_boxes(page, excluded):
     objects = []
     for obj in page.curves + page.lines + page.rects:
         box = _box(obj)
-        if _page_sized(box, page) or any(
-            other[0] <= box[0]
-            and other[1] <= box[1]
-            and other[2] >= box[2]
-            and other[3] >= box[3]
-            for other in excluded
-        ):
+        if _page_sized(box, page) or any(_box_inside(box, other) for other in excluded):
             continue
         if not obj.get("stroke"):
             color = obj.get("non_stroking_color")
@@ -494,10 +537,31 @@ class PdfMedia:
             self.document = PdfRaster(self.stream)
         return self.document.render(page.page_number - 1, 3)
 
-    def page(self, page, body_chars, excluded_boxes=()):
+    def page(self, page, body_chars, excluded_boxes=(), table_regions=()):
         items = self.candidates.get(page.page_number, [])
         logos, watermarks, images = [], [], []
         media_boxes = list(excluded_boxes)
+        table_boxes = []
+        for table in table_regions:
+            box = table["bbox"]
+            # 表格检测返回线中心；统一计入 1pt 坐标容差及描边半宽，避免外缘被拆成细条图。
+            margin = 1 + max(
+                (
+                    (obj.get("linewidth") or 0) / 2
+                    for obj in page.lines + page.rects + page.curves
+                    if obj.get("stroke") and _box_inside(_box(obj), box, tolerance=1)
+                ),
+                default=0,
+            )
+            table_boxes.append(
+                (
+                    max(0, box[0] - margin),
+                    max(0, box[1] - margin),
+                    min(page.width, box[2] + margin),
+                    min(page.height, box[3] + margin),
+                )
+            )
+        media_boxes.extend(table_boxes)
         bitmap = None
 
         def crop(box):
@@ -516,6 +580,19 @@ class PdfMedia:
                 )
             )
 
+        for table, box in zip(table_regions, table_boxes):
+            if table["as_image"]:
+                data = self.save_image(crop(box), page, "figure")
+                images.append(
+                    dict(
+                        kind="image",
+                        bbox=box,
+                        y=box[1],
+                        x0=box[0],
+                        markdown=f"![原文表格]({data})",
+                    )
+                )
+
         for item in items:
             x0, y0, x1, y1 = item["bbox"]
             key = item["key"]
@@ -526,6 +603,27 @@ class PdfMedia:
                     page.page_number,
                     item["bbox"],
                 )
+                continue
+            if any(_boxes_overlap(item["bbox"], box) for box in table_boxes):
+                if item["kind"] == "image":
+                    media_boxes.append(item["bbox"])
+                    bounds = (
+                        max(0, x0),
+                        max(0, y0),
+                        min(page.width, x1),
+                        min(page.height, y1),
+                    )
+                    for box in _outside_regions(bounds, table_boxes):
+                        data = self.save_image(crop(box), page, "image")
+                        images.append(
+                            dict(
+                                kind="image",
+                                bbox=box,
+                                y=box[1],
+                                x0=box[0],
+                                markdown=f"![原文插图]({data})",
+                            )
+                        )
                 continue
             repeated = key in self.repeated and area < 0.08
             if item["kind"] == "vector":
@@ -595,22 +693,25 @@ class PdfMedia:
                 images.append(
                     dict(
                         kind="image",
+                        bbox=item["bbox"],
                         y=y0,
                         x0=x0,
                         markdown=f"![原文插图]({data})",
                     )
                 )
         if body_chars or not page.images:
-            for box in _figure_boxes(page, media_boxes):
-                data = self.save_image(crop(box), page, "figure")
-                images.append(
-                    dict(
-                        kind="image",
-                        y=box[1],
-                        x0=box[0],
-                        markdown=f"![原文图示]({data})",
+            for region in _figure_boxes(page, media_boxes):
+                for box in _outside_regions(region, table_boxes):
+                    data = self.save_image(crop(box), page, "figure")
+                    images.append(
+                        dict(
+                            kind="image",
+                            bbox=box,
+                            y=box[1],
+                            x0=box[0],
+                            markdown=f"![原文图示]({data})",
+                        )
                     )
-                )
         # A tiled watermark is one page annotation even when its vector paths have
         # tiny coordinate differences and therefore different image fingerprints.
         unique_marks = {}

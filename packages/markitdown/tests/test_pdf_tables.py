@@ -5,10 +5,13 @@ from pathlib import Path
 
 import pdfplumber
 import pytest
+from PIL import Image
 from reportlab.pdfgen import canvas
+from reportlab.lib.utils import ImageReader
 
 from markitdown import MarkItDown
 from markitdown.converters._pdf_converter import _page_blocks
+from markitdown.converters._pdf_media import _box_inside
 
 
 def make_pdf(draw):
@@ -106,7 +109,133 @@ def test_real_pdf_only_emits_geometry_detected_tables(name):
                 and max(len(row.cells) for row in table.rows) >= 2
             ]
             blocks = _page_blocks(page, [])
-            assert len([block for block in blocks if block["kind"] == "table"]) == len(
-                expected
+            regions = [
+                block["bbox"]
+                for block in blocks
+                if block["kind"] in {"table", "table_image"}
+            ]
+            assert all(
+                any(_box_inside(table.bbox, region) for region in regions)
+                for table in expected
+            )
+            assert all(
+                region in [table.bbox for table in expected] for region in regions
             )
             page.close()
+
+
+@pytest.fixture
+def image_writer(tmp_path):
+    """记录实际写出的图片，便于检查一个表格只输出一次。"""
+    written = []
+
+    def write(data, suffix, page, role):
+        name = f"p{page}-{role}-{len(written)}.{suffix}"
+        (tmp_path / name).write_bytes(data)
+        written.append(name)
+        return name
+
+    return write
+
+
+def test_regular_table_keeps_empty_cells_without_images(image_writer, tmp_path):
+    def draw(pdf):
+        pdf.setFillColorRGB(1, 1, 1)
+        pdf.rect(0, 0, 612, 792, fill=1, stroke=0)
+        pdf.setFillColorRGB(0, 0, 0)
+        for y in (600, 650, 700):
+            pdf.line(50, y, 350, y)
+        for x in (50, 150, 350):
+            pdf.line(x, 600, x, 700)
+        pdf.drawString(60, 675, "ID")
+        pdf.drawString(160, 675, "Description")
+        pdf.drawString(60, 625, "A")
+
+    text = (
+        MarkItDown()
+        .convert_stream(
+            make_pdf(draw), file_extension=".pdf", pdf_image_writer=image_writer
+        )
+        .markdown
+    )
+    assert "| ID | Description |" in text and "| A |  |" in text
+    assert "![" not in text and not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize("merge", ["columns", "rows"])
+def test_merged_table_is_one_local_image_without_duplicate_text(
+    merge, image_writer, tmp_path
+):
+    def draw(pdf):
+        pdf.rect(50, 600, 300, 100)
+        if merge == "columns":
+            pdf.line(50, 650, 350, 650)
+            pdf.line(150, 600, 150, 650)
+        else:
+            pdf.line(150, 600, 150, 700)
+            pdf.line(150, 650, 350, 650)
+        pdf.drawString(60, 675, "MergedCell")
+        pdf.drawString(160, 625, "InsideCell")
+        pdf.drawString(50, 730, "Before")
+        pdf.drawString(50, 570, "After")
+
+    text = (
+        MarkItDown()
+        .convert_stream(
+            make_pdf(draw), file_extension=".pdf", pdf_image_writer=image_writer
+        )
+        .markdown
+    )
+    images = list(tmp_path.iterdir())
+    assert text.count("![原文表格]") == 1 and len(images) == 1
+    assert "MergedCell" not in text and "InsideCell" not in text and "| ---" not in text
+    assert text.index("Before") < text.index("![原文表格]") < text.index("After")
+    with Image.open(images[0]) as image:
+        # 允许描边与坐标容差，仍必须是表格局部裁剪，不能扩大为整页图。
+        assert 900 <= image.width <= 912 and 300 <= image.height <= 312
+
+
+def test_cell_image_is_owned_by_one_table_crop(image_writer, tmp_path):
+    def draw(pdf):
+        for y in (600, 650, 700):
+            pdf.line(50, y, 350, y)
+        for x in (50, 150, 350):
+            pdf.line(x, 600, x, 700)
+        pdf.drawString(60, 675, "ID")
+        pdf.drawString(160, 675, "Picture")
+        pdf.drawString(60, 625, "One")
+        pdf.drawImage(ImageReader(Image.new("RGB", (20, 20), "red")), 170, 610, 20, 20)
+
+    text = (
+        MarkItDown()
+        .convert_stream(
+            make_pdf(draw), file_extension=".pdf", pdf_image_writer=image_writer
+        )
+        .markdown
+    )
+    assert text.count("![原文表格]") == 1 and len(list(tmp_path.iterdir())) == 1
+    assert "![原文插图]" not in text and "| ---" not in text and "Picture" not in text
+
+
+def test_nested_table_uses_only_outer_crop(image_writer, tmp_path):
+    def draw(pdf):
+        for y in (500, 600, 700):
+            pdf.line(50, y, 350, y)
+        for x in (50, 150, 350):
+            pdf.line(x, 500, x, 700)
+        for y in (610, 640, 680):
+            pdf.line(180, y, 300, y)
+        for x in (180, 240, 300):
+            pdf.line(x, 610, x, 680)
+        pdf.drawString(60, 675, "Outer")
+        pdf.drawString(190, 655, "Nested")
+
+    text = (
+        MarkItDown()
+        .convert_stream(
+            make_pdf(draw), file_extension=".pdf", pdf_image_writer=image_writer
+        )
+        .markdown
+    )
+    assert text.count("![原文表格]") == 1 and len(list(tmp_path.iterdir())) == 1
+    assert "Outer" not in text and "Nested" not in text and "| ---" not in text

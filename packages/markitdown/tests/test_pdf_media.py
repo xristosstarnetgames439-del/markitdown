@@ -271,3 +271,83 @@ def test_tables_and_code_backgrounds_are_not_exported_as_figures(
     )
     assert "| Name | Value |" in text and "```javascript" in text
     assert "![" not in text and not list(tmp_path.iterdir())
+
+
+def test_ocr_excludes_text_already_owned_by_image():
+    """图片内文字不重复输出；像素坐标须先换算为 PDF 页面坐标。"""
+    from markitdown.converters._pdf_media import ocr_blocks
+
+    words = [
+        dict(
+            block_num="1",
+            par_num="1",
+            line_num="1",
+            left=left,
+            top=top,
+            width=20,
+            height=20,
+            text=text,
+            confidence=90,
+        )
+        for left, top, text in ((100, 100, "Inside"), (10, 10, "Outside"))
+    ]
+    with patch("markitdown.converters._pdf_media.ocr_words", return_value=words):
+        blocks, _ = ocr_blocks(
+            Image.new("RGB", (600, 800)), 300, 400, [(40, 40, 100, 100)]
+        )
+    assert "Inside" not in " ".join(block["markdown"] for block in blocks)
+    assert "Outside" in " ".join(block["markdown"] for block in blocks)
+
+
+def test_partial_image_preserves_only_area_outside_table():
+    from markitdown.converters._pdf_media import _outside_regions, _boxes_overlap
+
+    table = (20, 20, 80, 80)
+    regions = _outside_regions((0, 0, 100, 100), [table])
+    assert sum((box[2] - box[0]) * (box[3] - box[1]) for box in regions) == 6400
+    assert all(not _boxes_overlap(box, table) for box in regions)
+    assert all(
+        not _boxes_overlap(box, other)
+        for index, box in enumerate(regions)
+        for other in regions[index + 1 :]
+    )
+
+
+@pytest.mark.parametrize("merged", [False, True])
+@pytest.mark.parametrize("line_width", [0.48, 4])
+def test_table_border_overhang_is_not_exported_as_strips(
+    image_writer, tmp_path, merged, line_width
+):
+    """略超出网格边界的粗细描边归属表格，表外独立图形仍正常导出。"""
+
+    def draw(pdf):
+        pdf.drawString(20, 380, "Body outside table")
+        pdf.setLineWidth(line_width)
+        for x in (40, 150, 260):
+            top = 180 if merged and x == 150 else 260
+            pdf.line(x, 99.76, x, top + 0.24)
+        for y in (100, 180, 260):
+            pdf.line(39.76, y, 260.24, y)
+        for x, y, text in (
+            (50, 235, "Name"),
+            (160, 235, "Value"),
+            (50, 145, "One"),
+            (160, 145, "Two"),
+        ):
+            pdf.drawString(x, y, text)
+        pdf.setLineWidth(0.48)
+        pdf.circle(280, 330, 8)
+        pdf.line(280, 322, 280, 306)
+
+    text = (
+        MarkItDown()
+        .convert_stream(
+            pdf_bytes(draw), file_extension=".pdf", pdf_image_writer=image_writer
+        )
+        .markdown
+    )
+    assert text.count("![原文表格]") == int(merged)
+    assert text.count("![原文图示]") == 1
+    assert len(list(tmp_path.glob("*-figure-*.png"))) == 1 + int(merged)
+    if not merged:
+        assert "| Name | Value |" in text

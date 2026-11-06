@@ -13,6 +13,9 @@ from .._exceptions import MissingDependencyException, MISSING_DEPENDENCY_MESSAGE
 from .._stream_info import StreamInfo
 from ._pdf_media import (
     PdfMedia,
+    _box,
+    _box_inside,
+    _boxes_overlap,
     ocr_blocks,
     rotated_text,
     literal_text as _literal,
@@ -149,14 +152,86 @@ def _paragraphs(lines: list[dict], *, cell: bool = False) -> str:
     return _merge_partial_numbering_lines(("<br>" if cell else "\n\n").join(output))
 
 
+def _table_image_reason(table, page, detected):
+    """只将完整、无合并且列边界一致的网格交给 Markdown 表格渲染。"""
+    rows = [row.cells for row in table.rows]
+    if any(
+        len(row) != len(rows[0]) or any(cell is None for cell in row) for row in rows
+    ):
+        return "merged_or_missing_cell"
+    first = rows[0]
+    xs = [first[0][0], *[cell[2] for cell in first]]
+    ys = [row[0][1] for row in rows] + [rows[-1][0][3]]
+    close = lambda left, right: abs(left - right) <= 1
+    for index, row in enumerate(rows):
+        if any(
+            not close(cell[0], xs[column])
+            or not close(cell[2], xs[column + 1])
+            or not close(cell[1], ys[index])
+            or not close(cell[3], ys[index + 1])
+            for column, cell in enumerate(row)
+        ):
+            return "irregular_grid"
+    if any(
+        other is not table and _box_inside(other.bbox, table.bbox) for other in detected
+    ):
+        return "nested_table"
+    if any(_boxes_overlap(_box(image), table.bbox) for image in page.images):
+        return "cell_image"
+    for obj in page.curves + page.rects + page.lines:
+        box = _box(obj)
+        if not _boxes_overlap(box, table.bbox) or not (
+            obj.get("stroke") or obj.get("fill")
+        ):
+            continue
+        if (
+            obj.get("object_type") == "rect"
+            and _box_inside(table.bbox, box)
+            and not _box_inside(box, table.bbox)
+        ):
+            continue  # 页背景／外框不是单元格里的图形。
+        # 网格边框和整格底色可表达为普通表格；格内绘图不能压平为文字。
+        if obj.get("object_type") == "rect" and all(
+            any(close(value, edge) for edge in edges)
+            for value, edges in zip(box, (xs, ys, xs, ys))
+        ):
+            continue
+        if obj.get("object_type") == "curve":
+            current = start = None
+            on_grid = True
+            for operation, *points in obj.get("path", []):
+                if operation == "m":
+                    current = start = points[0]
+                    continue
+                if operation not in {"l", "h"} or current is None:
+                    on_grid = False
+                    break
+                target = start if operation == "h" else points[0]
+                if not (
+                    (
+                        close(current[0], target[0])
+                        and any(close(current[0], x) for x in xs)
+                    )
+                    or (
+                        close(current[1], target[1])
+                        and any(close(current[1], y) for y in ys)
+                    )
+                ):
+                    on_grid = False
+                    break
+                current = target
+            if on_grid and current is not None:
+                continue
+        return "cell_graphic"
+    return ""
+
+
 def _table_text(table: Any, assigned: dict[tuple, list[dict]], height: float) -> str:
+    """仅渲染通过网格检查的表格，不把合并单元格补成虚构空格。"""
     rows = []
     for row in table.rows:
         cells = []
         for box in row.cells:
-            if box is None:
-                cells.append("")
-                continue
             lines = _lines(assigned.get(tuple(box), []), height)
             # Narrow identifier columns are stacked labels; prose cells unwrap layout lines.
             stacked = (
@@ -186,8 +261,7 @@ def _table_text(table: Any, assigned: dict[tuple, list[dict]], height: float) ->
                     )
             cells.append("<br>".join(_literal(part) for part in value.split("<br>")))
         rows.append(cells)
-    width = max(map(len, rows))
-    rows = [row + [""] * (width - len(row)) for row in rows]
+    width = len(rows[0])
     rendered = ["| " + " | ".join(row) + " |" for row in rows]
     rendered.insert(1, "| " + " | ".join(["---"] * width) + " |")
     return "\n".join(rendered)
@@ -319,20 +393,36 @@ def _code_text(chars: list[dict], height: float, language: str = "") -> str:
 
 def _page_blocks(page: Any, code_regions: list[dict]) -> list[dict]:
     # Explicit line strategies never infer a table from aligned words or paragraph spacing.
-    tables = [
+    detected = [
         table
         for table in page.find_tables(
             {"vertical_strategy": "lines", "horizontal_strategy": "lines"}
         )
         if len(table.rows) >= 2 and max(len(row.cells) for row in table.rows) >= 2
     ]
+    tables = []
+    for table in sorted(
+        detected,
+        key=lambda item: (item.bbox[2] - item.bbox[0]) * (item.bbox[3] - item.bbox[1]),
+        reverse=True,
+    ):
+        if not any(_box_inside(table.bbox, owner.bbox) for owner in tables):
+            tables.append(table)
+    tables.sort(key=lambda table: (table.bbox[1], table.bbox[0]))
     code_boxes = _code_boxes(page, code_regions)
+    code_boxes = [
+        box
+        for box in code_boxes
+        if not any(_box_inside(box["bbox"], table.bbox) for table in tables)
+    ]
     table_chars: list[dict[tuple, list[dict]]] = [{} for table in tables]
     code_chars: list[list[dict]] = [[] for box in code_boxes]
     plain = []
     for char in page.chars:
         found = False
         for index, table in enumerate(tables):
+            if not _contains(table.bbox, char, page.height):
+                continue
             # Each glyph is owned once, including glyphs touching a cell's lower border.
             cell = next(
                 (
@@ -345,8 +435,9 @@ def _page_blocks(page: Any, code_regions: list[dict]) -> list[dict]:
             )
             if cell is not None:
                 table_chars[index].setdefault(cell, []).append(char)
-                found = True
-                break
+            # 整块表格统一占有文字，缺失／合并格中的字也不能再次流入正文。
+            found = True
+            break
         if found:
             continue
         for index, box in enumerate(code_boxes):
@@ -357,16 +448,24 @@ def _page_blocks(page: Any, code_regions: list[dict]) -> list[dict]:
         if not found:
             plain.append(char)
     blocks = _lines(plain, page.height)
-    blocks += [
-        dict(
-            kind="table",
-            bbox=table.bbox,
-            y=table.bbox[1],
-            x0=table.bbox[0],
-            markdown=_table_text(table, owned, page.height),
+    for table, owned in zip(tables, table_chars):
+        reason = _table_image_reason(table, page, detected)
+        blocks.append(
+            dict(
+                kind="table_image" if reason else "table",
+                bbox=table.bbox,
+                y=table.bbox[1],
+                x0=table.bbox[0],
+                markdown="" if reason else _table_text(table, owned, page.height),
+            )
         )
-        for table, owned in zip(tables, table_chars)
-    ]
+        _logger.info(
+            "TABLE_OUTPUT page=%d mode=%s reason=%s bbox=%s",
+            page.page_number,
+            "image" if reason else "markdown",
+            reason or "regular_grid",
+            table.bbox,
+        )
     blocks += [
         dict(
             kind="code",
@@ -514,7 +613,18 @@ class PdfConverter(DocumentConverter):
                             page,
                             bool(usable),
                             [block["bbox"] for block in blocks if "bbox" in block],
+                            table_regions=[
+                                dict(
+                                    bbox=block["bbox"],
+                                    as_image=block["kind"] == "table_image",
+                                )
+                                for block in blocks
+                                if block["kind"] in {"table", "table_image"}
+                            ],
                         )
+                        blocks = [
+                            block for block in blocks if block["kind"] != "table_image"
+                        ]
                         watermarks += vector_marks
                         if not usable and (page.images or page.curves):
                             bitmap = media.bitmap(page)
@@ -527,22 +637,30 @@ class PdfConverter(DocumentConverter):
                                 _logger.info("BLANK_SCAN page=%d", page.page_number)
                             else:
                                 blocks, confidence = ocr_blocks(
-                                    bitmap, page.width, page.height
+                                    bitmap,
+                                    page.width,
+                                    page.height,
+                                    [
+                                        block["bbox"]
+                                        for block in images
+                                        if "bbox" in block
+                                    ],
                                 )
                                 message = (
                                     "本页为 OCR 识别，复杂表格和公式请对照原 PDF 核对。"
                                     if blocks
                                     else "本页未识别到可靠文字，请对照原 PDF 人工核对。"
                                 )
-                                blocks.insert(
-                                    0,
-                                    dict(
-                                        kind="notice",
-                                        y=-1,
-                                        x0=0,
-                                        markdown="> " + message,
-                                    ),
-                                )
+                                if blocks or not images:
+                                    blocks.insert(
+                                        0,
+                                        dict(
+                                            kind="notice",
+                                            y=-1,
+                                            x0=0,
+                                            markdown="> " + message,
+                                        ),
+                                    )
                                 blocks.extend(images)
                         else:
                             blocks += images
