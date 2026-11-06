@@ -193,3 +193,81 @@ def test_image_conversion_requires_explicit_output_writer():
 
     with pytest.raises(Exception, match="pdf_image_writer"):
         MarkItDown().convert_stream(pdf_bytes(draw), file_extension=".pdf")
+
+
+def test_scan_ocr_does_not_append_whole_page_image(image_writer, tmp_path):
+    """扫描底图仅参与 OCR，不再作为核对图或独立插图写出。"""
+    from reportlab.lib.utils import ImageReader
+
+    def draw(pdf):
+        pdf.drawImage(ImageReader(Image.new("RGB", (300, 400), "gray")), 0, 0, 300, 400)
+
+    with patch(
+        "markitdown.converters._pdf_converter.ocr_blocks",
+        return_value=([dict(kind="ocr", y=20, x0=20, markdown="OCR body")], 90),
+    ):
+        text = (
+            MarkItDown()
+            .convert_stream(
+                pdf_bytes(draw), file_extension=".pdf", pdf_image_writer=image_writer
+            )
+            .markdown
+        )
+    assert "OCR body" in text and "![" not in text
+    assert "已保留原图" not in text and "页尾原图" not in text
+    assert not list(tmp_path.iterdir())
+
+
+def test_separate_vector_figures_are_cropped_individually(image_writer, tmp_path):
+    """独立图形不能合并成包含中间正文的大范围页面截图。"""
+
+    def draw(pdf):
+        pdf.drawString(20, 350, "Body outside figures")
+        for x, y in ((70, 250), (220, 100)):
+            pdf.circle(x, y, 15)
+            pdf.line(x + 15, y, x + 35, y)
+
+    text = (
+        MarkItDown()
+        .convert_stream(
+            pdf_bytes(draw), file_extension=".pdf", pdf_image_writer=image_writer
+        )
+        .markdown
+    )
+    images = list(tmp_path.glob("*-figure-*.png"))
+    assert text.count("![原文图示]") == 2 and len(images) == 2
+    for path in images:
+        with Image.open(path) as image:
+            assert image.width < 300 and image.height < 150
+
+
+def test_tables_and_code_backgrounds_are_not_exported_as_figures(
+    image_writer, tmp_path
+):
+    """已解析为表格或代码的区域只保留其 Markdown，不再重复生成图片。"""
+
+    def draw(pdf):
+        for x in (20, 80, 140):
+            pdf.line(x, 20, x, 100)
+        for y in (20, 60, 100):
+            pdf.line(20, y, 140, y)
+        pdf.drawString(30, 80, "Name")
+        pdf.drawString(90, 80, "Value")
+        pdf.drawString(30, 40, "One")
+        pdf.drawString(90, 40, "Two")
+        pdf.setFillColorRGB(0.96, 0.95, 0.94)
+        pdf.rect(20, 240, 260, 60, fill=1, stroke=0)
+        pdf.setFillColorRGB(0, 0, 0)
+        pdf.setFont("Courier", 10)
+        pdf.drawString(30, 280, "function hello() {")
+        pdf.drawString(30, 260, "  return 1;")
+
+    text = (
+        MarkItDown()
+        .convert_stream(
+            pdf_bytes(draw), file_extension=".pdf", pdf_image_writer=image_writer
+        )
+        .markdown
+    )
+    assert "| Name | Value |" in text and "```javascript" in text
+    assert "![" not in text and not list(tmp_path.iterdir())

@@ -360,6 +360,7 @@ def _page_blocks(page: Any, code_regions: list[dict]) -> list[dict]:
     blocks += [
         dict(
             kind="table",
+            bbox=table.bbox,
             y=table.bbox[1],
             x0=table.bbox[0],
             markdown=_table_text(table, owned, page.height),
@@ -369,6 +370,7 @@ def _page_blocks(page: Any, code_regions: list[dict]) -> list[dict]:
     blocks += [
         dict(
             kind="code",
+            bbox=box["bbox"],
             y=box["bbox"][1],
             x0=box["bbox"][0],
             markdown=_code_text(chars, page.height, box.get("language", "")),
@@ -494,7 +496,25 @@ class PdfConverter(DocumentConverter):
                     try:
                         chars, watermarks = rotated_text(page.chars)
                         usable = [c for c in chars if c.get("text", "").strip()]
-                        vector_marks, logos, images = media.page(page, bool(usable))
+                        blocks = []
+                        if usable:
+                            # 先确定正文表格和代码区域，避免把它们再次裁成图片。
+                            removed = {id(c) for c in page.chars} - {
+                                id(c) for c in chars
+                            }
+                            body_page = (
+                                page.filter(lambda obj: id(obj) not in removed)
+                                if removed
+                                else page
+                            )
+                            blocks = _page_blocks(
+                                body_page, code_regions.get(page.page_number, [])
+                            )
+                        vector_marks, logos, images = media.page(
+                            page,
+                            bool(usable),
+                            [block["bbox"] for block in blocks if "bbox" in block],
+                        )
                         watermarks += vector_marks
                         if not usable and (page.images or page.curves):
                             bitmap = media.bitmap(page)
@@ -510,9 +530,9 @@ class PdfConverter(DocumentConverter):
                                     bitmap, page.width, page.height
                                 )
                                 message = (
-                                    "本页为 OCR 识别，复杂表格和公式请核对页尾原图。"
+                                    "本页为 OCR 识别，复杂表格和公式请对照原 PDF 核对。"
                                     if blocks
-                                    else "本页未识别到可靠文字，已保留原图，请人工核对。"
+                                    else "本页未识别到可靠文字，请对照原 PDF 人工核对。"
                                 )
                                 blocks.insert(
                                     0,
@@ -523,34 +543,8 @@ class PdfConverter(DocumentConverter):
                                         markdown="> " + message,
                                     ),
                                 )
-                                if len(images) == 1 and images[0].get("full_page"):
-                                    images[0]["markdown"] = images[0][
-                                        "markdown"
-                                    ].replace("原文插图", f"第{page.page_number}页原图（OCR核对）")
-                                    blocks.extend(images)
-                                else:
-                                    blocks.extend(images)
-                                    blocks.append(
-                                        dict(
-                                            kind="image",
-                                            y=page.height,
-                                            x0=0,
-                                            markdown=f"![第{page.page_number}页原图（OCR核对）]({media.save_image(bitmap, page, 'page')})",
-                                        )
-                                    )
+                                blocks.extend(images)
                         else:
-                            # Filtering only removes rotated glyphs; table lines and code backgrounds stay.
-                            removed = {id(c) for c in page.chars} - {
-                                id(c) for c in chars
-                            }
-                            body_page = (
-                                page.filter(lambda obj: id(obj) not in removed)
-                                if removed
-                                else page
-                            )
-                            blocks = _page_blocks(
-                                body_page, code_regions.get(page.page_number, [])
-                            )
                             blocks += images
                             blocks.sort(key=lambda block: (block["y"], block["x0"]))
                         extracted += sum(

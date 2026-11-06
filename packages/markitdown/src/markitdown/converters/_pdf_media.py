@@ -233,31 +233,12 @@ def _union(boxes):
     )
 
 
-def media_candidates(page):
-    """Find repeatable image objects and small connected vector groups, not page backgrounds."""
-    candidates = []
-    area = page.width * page.height
-    for image_index, obj in enumerate(page.images):
-        box = _box(obj)
-        if box[2] <= 0 or box[3] <= 0 or box[0] >= page.width or box[1] >= page.height:
-            continue
-        if box[2] <= box[0] or box[3] <= box[1]:
-            continue
-        stream = obj.get("stream")
-        key = hashlib.sha256(stream.get_rawdata() or b"").hexdigest() if stream else ""
-        candidates.append(
-            dict(key="image-" + key, bbox=box, kind="image", image_index=image_index)
-        )
-    # Connect nearby paths of the same paint. Grid buckets avoid quadratic page-wide scans.
+def _connected_groups(objects, same_paint=False):
+    """按相邻绘图对象分组；复用网格索引，不按整页路径数量推断图片范围。"""
     groups, grid = [], defaultdict(set)
-    for curve in page.curves:
-        box = _box(curve)
-        if box[2] <= 0 or box[3] <= 0 or box[0] >= page.width or box[1] >= page.height:
-            continue
-        w, h = box[2] - box[0], box[3] - box[1]
-        if not curve.get("fill") or w <= 0 or h <= 0 or w * h > area * 0.03:
-            continue
-        color = str(curve.get("non_stroking_color"))
+    for obj in objects:
+        box = _box(obj)
+        color = str(obj.get("non_stroking_color")) if same_paint else ""
         cells = [
             (x, y, color)
             for x in range(int((box[0] - 3) // 24), int((box[2] + 3) // 24) + 1)
@@ -288,10 +269,93 @@ def media_candidates(page):
                     if j in ids:
                         ids.discard(j)
                         ids.add(i)
-        groups[i].append(curve)
+        groups[i].append(obj)
         for c in cells:
             grid[c].add(i)
-    for group in groups:
+    return [group for group in groups if group]
+
+
+def _page_sized(box, page):
+    """覆盖页宽和页高的扫描底图／页框，不作为独立插图输出。"""
+    width = min(page.width, box[2]) - max(0, box[0])
+    height = min(page.height, box[3]) - max(0, box[1])
+    return width >= page.width * 0.9 and height >= page.height * 0.9
+
+
+def _figure_boxes(page, excluded):
+    """只返回实际连通图形的边界，排除已有表格、代码、图片与重复图案。"""
+    objects = []
+    for obj in page.curves + page.lines + page.rects:
+        box = _box(obj)
+        if _page_sized(box, page) or any(
+            other[0] <= box[0]
+            and other[1] <= box[1]
+            and other[2] >= box[2]
+            and other[3] >= box[3]
+            for other in excluded
+        ):
+            continue
+        if not obj.get("stroke"):
+            color = obj.get("non_stroking_color")
+            color = (color,) if isinstance(color, (int, float)) else color
+            if not obj.get("fill") or (
+                isinstance(color, (tuple, list)) and color and min(color) >= 0.98
+            ):
+                continue
+        margin = max(0.5, (obj.get("linewidth") or 0) / 2)
+        box = (
+            max(0, box[0] - margin),
+            max(0, box[1] - margin),
+            min(page.width, box[2] + margin),
+            min(page.height, box[3] + margin),
+        )
+        if box[2] > box[0] and box[3] > box[1]:
+            objects.append(
+                {**obj, "x0": box[0], "top": box[1], "x1": box[2], "bottom": box[3]}
+            )
+    regions = []
+    for group in _connected_groups(objects):
+        box = _union([_box(obj) for obj in group])
+        if (
+            box[2] - box[0] < 12
+            or box[3] - box[1] < 12
+            or _page_sized(box, page)
+            or (len(group) < 2 and group[0].get("object_type") != "curve")
+        ):
+            continue
+        regions.append(box)
+    return regions
+
+
+def media_candidates(page):
+    """Find repeatable image objects and small connected vector groups, not page backgrounds."""
+    candidates = []
+    area = page.width * page.height
+    for image_index, obj in enumerate(page.images):
+        box = _box(obj)
+        if box[2] <= 0 or box[3] <= 0 or box[0] >= page.width or box[1] >= page.height:
+            continue
+        if box[2] <= box[0] or box[3] <= box[1]:
+            continue
+        stream = obj.get("stream")
+        key = hashlib.sha256(stream.get_rawdata() or b"").hexdigest() if stream else ""
+        candidates.append(
+            dict(key="image-" + key, bbox=box, kind="image", image_index=image_index)
+        )
+    curves = [
+        curve
+        for curve in page.curves
+        if curve.get("fill")
+        and curve["x1"] > curve["x0"]
+        and curve["bottom"] > curve["top"]
+        and curve["x1"] > 0
+        and curve["bottom"] > 0
+        and curve["x0"] < page.width
+        and curve["top"] < page.height
+        and (curve["x1"] - curve["x0"]) * (curve["bottom"] - curve["top"])
+        <= area * 0.03
+    ]
+    for group in _connected_groups(curves, same_paint=True):
         if len(group) < 3:
             continue
         box = _union([_box(c) for c in group])
@@ -430,9 +494,10 @@ class PdfMedia:
             self.document = PdfRaster(self.stream)
         return self.document.render(page.page_number - 1, 3)
 
-    def page(self, page, body_chars):
+    def page(self, page, body_chars, excluded_boxes=()):
         items = self.candidates.get(page.page_number, [])
         logos, watermarks, images = [], [], []
+        media_boxes = list(excluded_boxes)
         bitmap = None
 
         def crop(box):
@@ -441,6 +506,7 @@ class PdfMedia:
                 bitmap = self.bitmap(page)
             sx, sy = bitmap.width / page.width, bitmap.height / page.height
             x0, y0, x1, y1 = box
+            _logger.info("MEDIA_CROP page=%d bbox=%s", page.page_number, box)
             return bitmap.crop(
                 (
                     max(0, int(x0 * sx)),
@@ -454,6 +520,13 @@ class PdfMedia:
             x0, y0, x1, y1 = item["bbox"]
             key = item["key"]
             area = (x1 - x0) * (y1 - y0) / (page.width * page.height)
+            if item["kind"] == "image" and _page_sized(item["bbox"], page):
+                _logger.info(
+                    "MEDIA_SKIP page=%d reason=page_background bbox=%s",
+                    page.page_number,
+                    item["bbox"],
+                )
+                continue
             repeated = key in self.repeated and area < 0.08
             if item["kind"] == "vector":
                 repeated = repeated and (
@@ -465,6 +538,7 @@ class PdfMedia:
                 )
             if item["kind"] == "vector" and not repeated:
                 continue
+            media_boxes.append(item["bbox"])
             if repeated:
                 if key not in self.assets:
                     # OCR isolated slanted outlines only; ordinary logos keep their source appearance.
@@ -523,40 +597,20 @@ class PdfMedia:
                         kind="image",
                         y=y0,
                         x0=x0,
-                        full_page=area >= 0.9,
                         markdown=f"![原文插图]({data})",
                     )
                 )
-        # Complex vector illustrations have no recoverable Markdown topology. Keep a
-        # visual reference rather than inventing Mermaid edges from label positions.
-        repeat_boxes = [item["bbox"] for item in items if item["key"] in self.repeated]
-        artwork = [
-            curve
-            for curve in page.curves
-            if curve["bottom"] > page.height * 0.12
-            and curve["top"] < page.height * 0.9
-            and not any(
-                box[0] <= curve["x0"]
-                and box[1] <= curve["top"]
-                and box[2] >= curve["x1"]
-                and box[3] >= curve["bottom"]
-                for box in repeat_boxes
-            )
-        ]
-        if body_chars and len(artwork) >= 40:
-            data = self.save_image(
-                crop((0, page.height * 0.08, page.width, page.height * 0.94)),
-                page,
-                "figure",
-            )
-            images.append(
-                dict(
-                    kind="image",
-                    y=page.height,
-                    x0=0,
-                    markdown=f"![原页图示（布局核对）]({data})",
+        if body_chars or not page.images:
+            for box in _figure_boxes(page, media_boxes):
+                data = self.save_image(crop(box), page, "figure")
+                images.append(
+                    dict(
+                        kind="image",
+                        y=box[1],
+                        x0=box[0],
+                        markdown=f"![原文图示]({data})",
+                    )
                 )
-            )
         # A tiled watermark is one page annotation even when its vector paths have
         # tiny coordinate differences and therefore different image fingerprints.
         unique_marks = {}
